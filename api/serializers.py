@@ -111,3 +111,63 @@ class UserSerializer(serializers.ModelSerializer):
         model = User
         fields = ["id", "username", "first_name", "last_name", "email", "date_joined"]
         read_only_fields = fields
+
+
+# ──────────────────────────────────────────────
+# 4. FinancialProfile
+# ──────────────────────────────────────────────
+
+from .models import FinancialProfile, NetWorthSnapshot  # noqa: E402 (models imported after auth serializers)
+
+
+class FinancialProfileSerializer(serializers.ModelSerializer):
+    """
+    Read / update the authenticated user's financial profile.
+
+    net_worth is a read-only computed field (sum of the five buckets).
+    """
+
+    net_worth = serializers.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        read_only=True,
+    )
+
+    class Meta:
+        model  = FinancialProfile
+        fields = [
+            "id",
+            "emergency_fund",
+            "savings",
+            "rigs_fund",
+            "cash_on_hand",
+            "investments_total",
+            "net_worth",
+            "updated_at",
+        ]
+        read_only_fields = ["id", "net_worth", "updated_at"]
+
+
+# ──────────────────────────────────────────────
+# 5. NetWorthSnapshot
+# ──────────────────────────────────────────────
+
+class NetWorthSnapshotSerializer(serializers.ModelSerializer):
+    """
+    Read-only view of a historical net-worth snapshot.
+    Snapshots are created server-side; clients cannot POST them directly.
+    """
+
+    class Meta:
+        model  = NetWorthSnapshot
+        fields = [
+            "id",
+            "emergency_fund",
+            "savings",
+            "rigs_fund",
+            "cash_on_hand",
+            "investments_total",
+            "net_worth",
+            "captured_at",
+        ]
+        read_only_fields = fields
