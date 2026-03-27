@@ -1,22 +1,39 @@
+# api/serializers.py
 
 from django.contrib.auth.models import User
 from django.contrib.auth.password_validation import validate_password
 from rest_framework import serializers
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 
+from .models import AllocationLog, FinancialProfile, MonthCycle, NetWorthSnapshot
 
 
+# ──────────────────────────────────────────────────────────────────────
+# 1. Register
+# ──────────────────────────────────────────────────────────────────────
 
 class RegisterSerializer(serializers.ModelSerializer):
+    """
+    Creates a new User account.
+
+    Validates:
+      - username uniqueness (case-insensitive)
+      - email uniqueness (case-insensitive)
+      - password strength via Django's AUTH_PASSWORD_VALIDATORS
+      - password == confirm_password
+
+    Does not return tokens — the caller should POST /api/auth/token/ next.
+    """
+
     confirm_password = serializers.CharField(write_only=True, required=True)
     password = serializers.CharField(
         write_only=True,
         required=True,
-        validators=[validate_password],  
+        validators=[validate_password],
     )
 
     class Meta:
-        model = User
+        model  = User
         fields = [
             "id",
             "username",
@@ -32,16 +49,12 @@ class RegisterSerializer(serializers.ModelSerializer):
             "email":      {"required": True},
         }
 
-    # ── Validation ────────────────────────────
-
     def validate_email(self, value: str) -> str:
-        """Email must be unique."""
         if User.objects.filter(email__iexact=value).exists():
             raise serializers.ValidationError("A user with this email already exists.")
         return value.lower()
 
     def validate_username(self, value: str) -> str:
-        """Username uniqueness is handled by the model, but surface a cleaner message."""
         if User.objects.filter(username__iexact=value).exists():
             raise serializers.ValidationError("This username is already taken.")
         return value
@@ -51,45 +64,41 @@ class RegisterSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError({"confirm_password": "Passwords do not match."})
         return attrs
 
-    # ── Create ────────────────────────────────
-
     def create(self, validated_data: dict) -> User:
         validated_data.pop("confirm_password")
-        user = User.objects.create_user(
-            username=validated_data["username"],
-            email=validated_data["email"],
-            password=validated_data["password"],
-            first_name=validated_data.get("first_name", ""),
-            last_name=validated_data.get("last_name", ""),
+        return User.objects.create_user(
+            username   = validated_data["username"],
+            email      = validated_data["email"],
+            password   = validated_data["password"],
+            first_name = validated_data.get("first_name", ""),
+            last_name  = validated_data.get("last_name", ""),
         )
-        return user
 
 
-# ──────────────────────────────────────────────
-# 2. Custom JWT claim pair (login)
-# ──────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────
+# 2. Login — custom JWT pair
+# ──────────────────────────────────────────────────────────────────────
 
 class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
     """
-    Extends the default JWT login response to include basic user info
-    alongside the access + refresh tokens.
+    Extends the default JWT login response to include basic user info.
 
     Response shape:
-    {
-        "access":     "<JWT>",
-        "refresh":    "<JWT>",
-        "user": {
-            "id":         1,
-            "username":   "juandelacruz",
-            "first_name": "Juan",
-            "last_name":  "dela Cruz",
-            "email":      "juan@example.com"
+        {
+            "access":  "<JWT>",
+            "refresh": "<JWT>",
+            "user": {
+                "id":         1,
+                "username":   "juandelacruz",
+                "first_name": "Juan",
+                "last_name":  "dela Cruz",
+                "email":      "juan@example.com"
+            }
         }
-    }
     """
 
     def validate(self, attrs: dict) -> dict:
-        data = super().validate(attrs)          # runs credential check + adds tokens
+        data = super().validate(attrs)
         data["user"] = {
             "id":         self.user.id,
             "username":   self.user.username,
@@ -100,31 +109,29 @@ class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
         return data
 
 
-# ──────────────────────────────────────────────
-# 3. User read-only (for /api/me/)
-# ──────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────
+# 3. User — read-only
+# ──────────────────────────────────────────────────────────────────────
 
 class UserSerializer(serializers.ModelSerializer):
-    """Read-only snapshot of the authenticated user."""
+    """Read-only snapshot of the authenticated user. Used by GET /api/auth/me/."""
 
     class Meta:
-        model = User
-        fields = ["id", "username", "first_name", "last_name", "email", "date_joined"]
+        model        = User
+        fields       = ["id", "username", "first_name", "last_name", "email", "date_joined"]
         read_only_fields = fields
 
 
-# ──────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────
 # 4. FinancialProfile
-# ──────────────────────────────────────────────
-
-from .models import FinancialProfile, NetWorthSnapshot  # noqa: E402 (models imported after auth serializers)
-
+# ──────────────────────────────────────────────────────────────────────
 
 class FinancialProfileSerializer(serializers.ModelSerializer):
     """
-    Read / update the authenticated user's financial profile.
+    Read / partial-update the authenticated user's financial profile.
 
-    net_worth is a read-only computed field (sum of the five buckets).
+    net_worth is a read-only computed property on the model.
+    All five bucket fields are individually writable via PATCH.
     """
 
     net_worth = serializers.DecimalField(
@@ -148,14 +155,14 @@ class FinancialProfileSerializer(serializers.ModelSerializer):
         read_only_fields = ["id", "net_worth", "updated_at"]
 
 
-# ──────────────────────────────────────────────
-# 5. NetWorthSnapshot
-# ──────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────
+# 5. NetWorthSnapshot — read-only
+# ──────────────────────────────────────────────────────────────────────
 
 class NetWorthSnapshotSerializer(serializers.ModelSerializer):
     """
-    Read-only view of a historical net-worth snapshot.
-    Snapshots are created server-side; clients cannot POST them directly.
+    Read-only historical net-worth snapshot.
+    Snapshots are created server-side only — clients cannot POST them directly.
     """
 
     class Meta:
@@ -169,5 +176,53 @@ class NetWorthSnapshotSerializer(serializers.ModelSerializer):
             "investments_total",
             "net_worth",
             "captured_at",
+        ]
+        read_only_fields = fields
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 6. AllocationLog — read-only
+# ──────────────────────────────────────────────────────────────────────
+
+class AllocationLogSerializer(serializers.ModelSerializer):
+    """Read-only ledger entry for a single fund transfer within a MonthCycle."""
+
+    class Meta:
+        model  = AllocationLog
+        fields = ["id", "from_bucket", "to_bucket", "amount", "timestamp"]
+        read_only_fields = fields
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 7. MonthCycle — read-only (mutations happen via the allocation engine)
+# ──────────────────────────────────────────────────────────────────────
+
+class MonthCycleSerializer(serializers.ModelSerializer):
+    """
+    Full representation of a MonthCycle including its allocation log entries.
+    Cycles are created and mutated by the allocation engine, never directly
+    by the client.
+    """
+
+    allocation_logs = AllocationLogSerializer(many=True, read_only=True)
+
+    class Meta:
+        model  = MonthCycle
+        fields = [
+            "id",
+            "year",
+            "month",
+            "income",
+            # ── What was allocated into each fund ──
+            "emergency_fund_budget",
+            "rigs_fund_budget",
+            "savings_budget",
+            # ── Spendable budgets ──
+            "expenses_budget",
+            "wants_budget",
+            "remaining_budget",
+            "status",
+            "created_at",
+            "allocation_logs",
         ]
         read_only_fields = fields
