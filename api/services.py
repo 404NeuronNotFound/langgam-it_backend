@@ -235,6 +235,9 @@ def run_expense(
     profile.cash_on_hand -= amount
     profile.save()
 
+    # Capture net worth snapshot after expense deduction
+    NetWorthSnapshot.capture(profile)
+
     # Step 16–19 — run AI monitoring engine and return any alerts created
     return run_monitoring_engine(profile, cycle, expense)
 

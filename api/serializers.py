@@ -5,7 +5,7 @@ from django.contrib.auth.password_validation import validate_password
 from rest_framework import serializers
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 
-from .models import AllocationLog, FinancialProfile, MonthCycle, NetWorthSnapshot
+from .models import AllocationLog, FinancialProfile, MonthCycle, NetWorthSnapshot, Alert, Expense
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -226,3 +226,48 @@ class MonthCycleSerializer(serializers.ModelSerializer):
             "allocation_logs",
         ]
         read_only_fields = fields
+
+class ExpenseSerializer(serializers.ModelSerializer):
+    """
+    Serializer for creating and reading expense records.
+    
+    Write fields (POST):
+        - amount: required, decimal
+        - category: required, "needs" or "wants"
+        - description: optional, string
+        - date: optional, defaults to today
+    
+    Read-only fields:
+        - id, cycle, created_at (set by server)
+    """
+    
+    class Meta:
+        model = Expense
+        fields = [
+            "id",
+            "cycle",
+            "amount",
+            "category",
+            "description",
+            "date",
+            "created_at",
+        ]
+        read_only_fields = ["id", "cycle", "created_at"]
+        extra_kwargs = {
+            "date": {"required": False},
+            "description": {"required": False, "allow_blank": True},
+        }
+
+class AlertSerializer(serializers.ModelSerializer):
+    type_display = serializers.CharField(source="get_type_display", read_only=True)
+
+    class Meta:
+        model = Alert
+        fields = [
+            "id",
+            "type",
+            "type_display",
+            "message",
+            "is_read",
+            "created_at",
+        ]
