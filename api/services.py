@@ -21,9 +21,10 @@
 #
 # ── SURVIVAL MODE (income == 0) ───────────────────────────────────────────────
 #
-#   expenses_budget = ₱5,000  (drawn from emergency_fund)
+#   emergency_fund draws ₱5,000 → cash_on_hand (trackable for expenses)
+#   expenses_budget = ₱5,000
 #   wants_budget    = ₱0
-#   remaining_budget = ₱0
+#   remaining_budget = ₱5,000
 #
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -78,15 +79,17 @@ def run_allocation_engine(
 
     # ── SURVIVAL MODE ─────────────────────────────────────────────────────────
     if income == Decimal("0.00"):
-        # Draw up to ₱5,000 from emergency fund for bare-minimum expenses
+        # Draw up to ₱5,000 from emergency_fund → cash_on_hand
+        # so the user has real trackable cash to cover expenses this month.
         draw = min(EXPENSES_BUDGET_SURVIVAL, profile.emergency_fund)
         profile.emergency_fund -= draw
-        _log(cycle, "emergency_fund", "expenses_budget", draw)
+        profile.cash_on_hand   += draw                  # ← lands here for expense tracking
+        _log(cycle, "emergency_fund", "cash_on_hand", draw)
 
-        cycle.emergency_fund_budget = Decimal("0.00")  # nothing went IN to EF
+        cycle.emergency_fund_budget = Decimal("0.00")   # nothing went IN to EF this cycle
         cycle.rigs_fund_budget      = Decimal("0.00")
         cycle.savings_budget        = Decimal("0.00")
-        cycle.expenses_budget       = draw              # may be < 5k if EF is low
+        cycle.expenses_budget       = draw              # earmarked for needs spending
         cycle.wants_budget          = Decimal("0.00")
         cycle.remaining_budget      = draw
 
@@ -108,7 +111,6 @@ def run_allocation_engine(
         profile.cash_on_hand   -= ef_transfer
         _log(cycle, "cash_on_hand", "emergency_fund", ef_transfer)
     cycle.emergency_fund_budget = ef_transfer
-
 
     # Step 5 — reserve spendable budget from cash_on_hand
     # The ₱10,000 (₱7k needs + ₱3k wants) stays in cash_on_hand as earmarked
@@ -149,10 +151,8 @@ def run_allocation_engine(
         _log(cycle, "cash_on_hand", "savings", savings_transfer)
     cycle.savings_budget = savings_transfer
 
-    # Whatever remains in cash_on_hand is genuinely unallocated liquid cash
-    # (covers the earmarked spendable + any leftover after all allocations)
     # Add the reserved spendable back so cash_on_hand reflects the full
-    # amount the user can actually spend day-to-day.
+    # amount the user can actually spend day-to-day (earmark + any leftover).
     profile.cash_on_hand += spendable_reserved
 
     profile.save()
