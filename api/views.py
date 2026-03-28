@@ -1,5 +1,7 @@
 # api/views.py
 
+import calendar
+from datetime import date
 from decimal import Decimal
 
 from django.contrib.auth.models import User
@@ -9,16 +11,18 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework_simplejwt.views import TokenObtainPairView
 
-from .models import FinancialProfile, MonthCycle, NetWorthSnapshot
+from .models import Alert, Expense, FinancialProfile, MonthCycle, NetWorthSnapshot
 from .serializers import (
+    AlertSerializer,
     CustomTokenObtainPairSerializer,
+    ExpenseSerializer,
     FinancialProfileSerializer,
     MonthCycleSerializer,
     NetWorthSnapshotSerializer,
     RegisterSerializer,
     UserSerializer,
 )
-from .services import run_allocation_engine, run_invest
+from .services import run_allocation_engine, run_expense, run_invest
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -157,7 +161,7 @@ class IncomeView(APIView):
 
     Allocation order (normal mode):
         income → cash_on_hand
-             → emergency_fund  (fill to ₱10,000)
+             → emergency_fund  (₱10,000 per cycle, grows continuously)
              → spendable reserved (₱10,000: ₱7k needs + ₱3k wants)
              → rigs_fund        (up to ₱10,000)
              → savings          (up to ₱20,000)
@@ -203,19 +207,10 @@ class IncomeView(APIView):
             # Re-running this month: clear prior allocation logs and reset cycle
             cycle.allocation_logs.all().delete()
 
-        # Snapshot BEFORE so we can debug what changed
-        ef_before = profile.emergency_fund
-
-        cycle = run_allocation_engine(profile, cycle, income)
-
-        # Always re-read from DB to guarantee the response reflects persisted state
+        # Refresh profile from database to ensure we have the latest values
         profile.refresh_from_db()
 
-        print(
-            f"[income] EF before={ef_before} | after={profile.emergency_fund} | "
-            f"rigs={profile.rigs_fund} | savings={profile.savings} | "
-            f"cash={profile.cash_on_hand}"
-        )
+        cycle = run_allocation_engine(profile, cycle, income)
 
         return Response(
             {
@@ -224,7 +219,6 @@ class IncomeView(APIView):
             },
             status=status.HTTP_200_OK,
         )
-
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -328,3 +322,273 @@ class CurrentMonthCycleView(APIView):
             MonthCycleSerializer(cycle).data,
             status=status.HTTP_200_OK,
         )
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 10. Log Expense  →  POST /api/expenses/
+# ──────────────────────────────────────────────────────────────────────
+
+class ExpenseView(APIView):
+    """
+    Log a spending transaction for the current active cycle.
+
+    POST  /api/expenses/
+
+    Request body:
+        {
+            "amount":      "250.00",
+            "category":    "needs",        -- "needs" | "wants"
+            "description": "Groceries",    -- optional
+            "date":        "2026-03-28"    -- optional; defaults to today
+        }
+
+    What happens on success
+    -----------------------
+    1. Expense record is created and linked to the active cycle.
+    2. cash_on_hand is reduced by amount.
+    3. The correct budget bucket is reduced (expenses_budget or wants_budget).
+    4. remaining_budget is reduced.
+    5. AI monitoring engine runs (Steps 16–19).
+    6. Any triggered alerts are returned alongside the expense.
+
+    Success 201:
+        {
+            "expense":  { ... },
+            "profile":  { ... updated buckets ... },
+            "cycle":    { ... updated budgets ... },
+            "alerts":   [ ... any new alerts ... ]
+        }
+    """
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        # Resolve active cycle
+        cycle = (
+            MonthCycle.objects
+            .filter(user=request.user, status=MonthCycle.STATUS_ACTIVE)
+            .order_by("-year", "-month")
+            .first()
+        )
+        if cycle is None:
+            return Response(
+                {"error": "No active month cycle. Submit income via POST /api/income/ first."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        profile, _ = FinancialProfile.objects.get_or_create(user=request.user)
+
+        # Validate incoming data
+        serializer = ExpenseSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        amount   = serializer.validated_data["amount"]
+        category = serializer.validated_data["category"]
+
+        # Guard: cannot spend more than what's in cash_on_hand
+        if amount > profile.cash_on_hand:
+            return Response(
+                {
+                    "error": (
+                        f"Insufficient cash on hand. "
+                        f"Available: ₱{profile.cash_on_hand:,.2f}, "
+                        f"requested: ₱{amount:,.2f}."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # Resolve expense date (default to today)
+        expense_date = serializer.validated_data.get("date") or timezone.localdate()
+
+        # Persist the expense record
+        expense = Expense.objects.create(
+            user        = request.user,
+            cycle       = cycle,
+            amount      = amount,
+            category    = category,
+            description = serializer.validated_data.get("description", ""),
+            date        = expense_date,
+        )
+
+        # Run deduction + monitoring engine
+        new_alerts = run_expense(profile, cycle, expense)
+
+        # Re-read from DB to return fully persisted state
+        profile.refresh_from_db()
+        cycle.refresh_from_db()
+
+        return Response(
+            {
+                "expense": ExpenseSerializer(expense).data,
+                "profile": FinancialProfileSerializer(profile).data,
+                "cycle":   MonthCycleSerializer(cycle).data,
+                "alerts":  AlertSerializer(new_alerts, many=True).data,
+            },
+            status=status.HTTP_201_CREATED,
+        )
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 11. Daily Limit  →  GET /api/expenses/daily-limit/
+# ──────────────────────────────────────────────────────────────────────
+
+class DailyLimitView(APIView):
+    """
+    Return the computed daily spending limit for the current active cycle.
+
+    GET  /api/expenses/daily-limit/
+
+    Formula:
+        remaining_days = total_days_in_month - today
+        daily_limit    = remaining_budget / remaining_days
+
+    Success 200:
+        {
+            "daily_limit":     "333.33",
+            "remaining_budget":"5000.00",
+            "remaining_days":  15,
+            "today_spent":     "450.00"
+        }
+
+    404 if no active cycle exists.
+    """
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        cycle = (
+            MonthCycle.objects
+            .filter(user=request.user, status=MonthCycle.STATUS_ACTIVE)
+            .order_by("-year", "-month")
+            .first()
+        )
+        if cycle is None:
+            return Response(
+                {"detail": "No active cycle. Submit income via POST /api/income/."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        today          = timezone.localdate()
+        total_days     = calendar.monthrange(today.year, today.month)[1]
+        remaining_days = max(1, total_days - today.day)
+        daily_limit    = cycle.remaining_budget / Decimal(remaining_days)
+
+        # Total spent today
+        today_spent = (
+            Expense.objects
+            .filter(cycle=cycle, date=today)
+            .values_list("amount", flat=True)
+        )
+        today_spent = sum(today_spent, Decimal("0.00"))
+
+        return Response(
+            {
+                "daily_limit":      round(daily_limit, 2),
+                "remaining_budget": cycle.remaining_budget,
+                "remaining_days":   remaining_days,
+                "today_spent":      today_spent,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 12. List Expenses  →  GET /api/expenses/
+# ──────────────────────────────────────────────────────────────────────
+
+class ExpenseListView(generics.ListAPIView):
+    """
+    Return all expenses for the authenticated user's active cycle, newest first.
+
+    GET  /api/expenses/
+
+    Optional query params:
+        ?cycle=<id>     filter by a specific cycle id
+        ?category=needs filter by category
+    """
+
+    serializer_class   = ExpenseSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        qs = Expense.objects.filter(user=self.request.user)
+
+        cycle_id = self.request.query_params.get("cycle")
+        if cycle_id:
+            qs = qs.filter(cycle_id=cycle_id)
+        else:
+            # Default: active cycle only
+            active_cycle = (
+                MonthCycle.objects
+                .filter(user=self.request.user, status=MonthCycle.STATUS_ACTIVE)
+                .order_by("-year", "-month")
+                .first()
+            )
+            if active_cycle:
+                qs = qs.filter(cycle=active_cycle)
+            else:
+                qs = qs.none()
+
+        category = self.request.query_params.get("category")
+        if category:
+            qs = qs.filter(category=category)
+
+        return qs
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 13. Alerts  →  GET /api/alerts/
+# ──────────────────────────────────────────────────────────────────────
+
+class AlertListView(generics.ListAPIView):
+    """
+    Return unread alerts for the authenticated user, newest first.
+
+    GET  /api/alerts/
+
+    To include read alerts, pass ?all=true.
+
+    Success 200:
+        [ { "id", "type", "message", "is_read", "created_at" }, ... ]
+    """
+
+    serializer_class   = AlertSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        qs = Alert.objects.filter(user=self.request.user)
+        if self.request.query_params.get("all") != "true":
+            qs = qs.filter(is_read=False)
+        return qs
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 14. Mark Alert Read  →  PATCH /api/alerts/<id>/read/
+# ──────────────────────────────────────────────────────────────────────
+
+class AlertMarkReadView(APIView):
+    """
+    Mark a single alert as read.
+
+    PATCH  /api/alerts/<id>/read/
+
+    Success 200:
+        { "id": 1, "is_read": true, ... }
+
+    404 if the alert does not belong to the authenticated user.
+    """
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def patch(self, request, pk: int):
+        try:
+            alert = Alert.objects.get(pk=pk, user=request.user)
+        except Alert.DoesNotExist:
+            return Response(
+                {"detail": "Alert not found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        alert.is_read = True
+        alert.save(update_fields=["is_read"])
+        return Response(AlertSerializer(alert).data, status=status.HTTP_200_OK)

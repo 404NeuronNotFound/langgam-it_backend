@@ -19,7 +19,7 @@ class FinancialProfile(models.Model):
 
     Buckets
     -------
-    emergency_fund    — liquid safety net (target: ₱10,000)
+    emergency_fund    — liquid safety net (receives ₱10,000 per cycle, grows continuously)
     savings           — general savings pool
     rigs_fund         — dedicated equipment fund (target: ₱10,000 per cycle)
     cash_on_hand      — physical / wallet cash + unallocated liquid money
@@ -152,7 +152,7 @@ class MonthCycle(models.Model):
 
     Allocation fields
     -----------------
-    emergency_fund_budget — how much went INTO the emergency fund this cycle
+    emergency_fund_budget — how much went INTO the emergency fund this cycle (₱10,000 per cycle)
     rigs_fund_budget      — how much went INTO the rigs fund this cycle
     savings_budget        — how much went INTO savings this cycle
     expenses_budget       — earmarked for needs spending (₱7,000 normal / ₱5,000 survival)
@@ -248,4 +248,125 @@ class AllocationLog(models.Model):
             f"cycle={self.cycle_id}, "
             f"{self.from_bucket} → {self.to_bucket}, "
             f"₱{self.amount:,.2f})"
+        )
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 5. Expense  (daily transaction — deducted from cash_on_hand)
+# ──────────────────────────────────────────────────────────────────────
+
+class Expense(models.Model):
+    """
+    Records a single spending transaction for a user within a MonthCycle.
+
+    Every expense is deducted from cash_on_hand immediately on creation.
+    The category determines which budget bucket it draws from:
+        needs  → expenses_budget
+        wants  → wants_budget
+
+    After every expense is saved, the AI monitoring engine runs to check
+    for overspending, daily limit breaches, hard stops, and low emergency fund.
+    """
+
+    CATEGORY_NEEDS = "needs"
+    CATEGORY_WANTS = "wants"
+    CATEGORY_CHOICES = [
+        (CATEGORY_NEEDS, "Needs"),
+        (CATEGORY_WANTS, "Wants"),
+    ]
+
+    user  = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name="expenses",
+    )
+    cycle = models.ForeignKey(
+        MonthCycle,
+        on_delete=models.CASCADE,
+        related_name="expenses",
+    )
+
+    amount      = models.DecimalField(max_digits=14, decimal_places=2)
+    category    = models.CharField(max_length=10, choices=CATEGORY_CHOICES)
+    description = models.CharField(max_length=255, blank=True, default="")
+    date        = models.DateField()                    # user-supplied date of the expense
+
+    created_at  = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name        = "Expense"
+        verbose_name_plural = "Expenses"
+        ordering            = ["-date", "-created_at"]
+
+    def __str__(self) -> str:
+        return (
+            f"Expense("
+            f"{self.user.username}, "
+            f"{self.category}, "
+            f"₱{self.amount:,.2f}, "
+            f"{self.date})"
+        )
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 6. Alert  (AI-generated spending warnings)
+# ──────────────────────────────────────────────────────────────────────
+
+class Alert(models.Model):
+    """
+    Stores an AI-generated warning triggered by the monitoring engine.
+
+    Created automatically after every expense is logged. Clients poll
+    GET /api/alerts/ to surface unread alerts to the user.
+
+    Alert types
+    -----------
+    overspend       — actual spend is ahead of the expected daily pace
+    daily_limit     — today's spending has exceeded the computed daily limit
+    hard_stop       — remaining_budget has hit ₱0 (stop spending)
+    emergency_low   — emergency_fund has dropped below ₱10,000
+
+    is_read is flipped to True by PATCH /api/alerts/<id>/read/
+    """
+
+    TYPE_OVERSPEND     = "overspend"
+    TYPE_DAILY_LIMIT   = "daily_limit"
+    TYPE_HARD_STOP     = "hard_stop"
+    TYPE_EMERGENCY_LOW = "emergency_low"
+
+    TYPE_CHOICES = [
+        (TYPE_OVERSPEND,     "Overspend"),
+        (TYPE_DAILY_LIMIT,   "Daily limit exceeded"),
+        (TYPE_HARD_STOP,     "Hard stop — budget depleted"),
+        (TYPE_EMERGENCY_LOW, "Emergency fund low"),
+    ]
+
+    user    = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name="alerts",
+    )
+    cycle   = models.ForeignKey(
+        MonthCycle,
+        on_delete=models.CASCADE,
+        related_name="alerts",
+    )
+
+    type    = models.CharField(max_length=20, choices=TYPE_CHOICES)
+    message = models.TextField()
+    is_read = models.BooleanField(default=False)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name        = "Alert"
+        verbose_name_plural = "Alerts"
+        ordering            = ["-created_at"]
+
+    def __str__(self) -> str:
+        return (
+            f"Alert("
+            f"{self.user.username}, "
+            f"{self.type}, "
+            f"read={self.is_read})"
         )
