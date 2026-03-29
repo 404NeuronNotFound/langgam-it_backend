@@ -7,9 +7,15 @@
 #
 #   income lands in cash_on_hand
 #       ↓
-#   Step 4  → emergency_fund (₱10,000 per cycle, grows continuously)
+#   Step 4  → spendable_budget (₱10,000: ₱7k needs + ₱3k wants) — PRIORITY #1
 #       ↓
-#   Step 5  → reserve expenses_budget (₱7,000) + wants_budget (₱3,000)
+#   Step 5  → emergency_fund (₱10,000 per cycle, grows continuously) — PRIORITY #2
+#       ↓
+#   Step 6  → rigs_fund (up to ₱10,000 per cycle)
+#       ↓
+#   Step 7  → savings (up to ₱20,000 per cycle)
+#       ↓
+#   leftover stays in cash_on_hand for bills, extras, etc.
 #             these stay in cash_on_hand but are earmarked as "spendable"
 #             remaining_budget = ₱10,000
 #       ↓
@@ -21,9 +27,15 @@
 #
 # ── SURVIVAL MODE (income == 0) ───────────────────────────────────────────────
 #
-#   expenses_budget = ₱5,000  (drawn from emergency_fund)
-#   wants_budget    = ₱0
-#   remaining_budget = ₱0
+#   IF cash_on_hand >= ₱5,000:
+#       expenses_budget = ₱5,000  (use existing cash_on_hand)
+#       wants_budget    = ₱0
+#       emergency_fund  = unchanged (no withdrawal needed)
+#
+#   ELSE (cash_on_hand < ₱5,000):
+#       draw from emergency_fund to top up cash_on_hand
+#       expenses_budget = whatever is available
+#       wants_budget    = ₱0
 #
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -80,19 +92,33 @@ def run_allocation_engine(
 
     # ── SURVIVAL MODE ─────────────────────────────────────────────────────────
     if income == Decimal("0.00"):
-        # Draw up to ₱5,000 from emergency_fund and put it in cash_on_hand
-        # so the user has real spendable money to cover their month.
-        draw = min(EXPENSES_BUDGET_SURVIVAL, profile.emergency_fund)
-        profile.emergency_fund -= draw
-        profile.cash_on_hand   += draw                          # ← money is now spendable
-        _log(cycle, "emergency_fund", "cash_on_hand", draw)
-
-        cycle.emergency_fund_budget = Decimal("0.00")           # nothing went IN to EF
-        cycle.rigs_fund_budget      = Decimal("0.00")
-        cycle.savings_budget        = Decimal("0.00")
-        cycle.expenses_budget       = draw                      # earmarked for needs
-        cycle.wants_budget          = Decimal("0.00")
-        cycle.remaining_budget      = draw                      # total they can spend
+        # Check if user has enough cash_on_hand to cover survival expenses
+        # Only draw from emergency_fund if cash_on_hand is insufficient
+        
+        if profile.cash_on_hand >= EXPENSES_BUDGET_SURVIVAL:
+            # User has enough cash on hand, no need to touch emergency fund
+            cycle.expenses_budget       = EXPENSES_BUDGET_SURVIVAL
+            cycle.wants_budget          = Decimal("0.00")
+            cycle.remaining_budget      = EXPENSES_BUDGET_SURVIVAL
+            cycle.emergency_fund_budget = Decimal("0.00")
+            cycle.rigs_fund_budget      = Decimal("0.00")
+            cycle.savings_budget        = Decimal("0.00")
+        else:
+            # Cash on hand is insufficient, draw from emergency fund
+            # Calculate how much we need from emergency fund
+            needed = EXPENSES_BUDGET_SURVIVAL - profile.cash_on_hand
+            draw = min(needed, profile.emergency_fund)
+            
+            profile.emergency_fund -= draw
+            profile.cash_on_hand   += draw
+            _log(cycle, "emergency_fund", "cash_on_hand", draw)
+            
+            cycle.emergency_fund_budget = Decimal("0.00")           # nothing went IN to EF
+            cycle.rigs_fund_budget      = Decimal("0.00")
+            cycle.savings_budget        = Decimal("0.00")
+            cycle.expenses_budget       = profile.cash_on_hand      # whatever is available
+            cycle.wants_budget          = Decimal("0.00")
+            cycle.remaining_budget      = profile.cash_on_hand
 
         profile.save()
         NetWorthSnapshot.capture(profile)
@@ -105,24 +131,14 @@ def run_allocation_engine(
     profile.cash_on_hand += income
     _log(cycle, "income", "cash_on_hand", income)
 
-    # Step 4 — allocate ₱10,000 to emergency fund every cycle (priority #1)
-    # Emergency fund grows continuously as a safety net, no cap
-    ef_transfer = min(EMERGENCY_FUND_ALLOCATION, profile.cash_on_hand)
-    if ef_transfer > Decimal("0.00"):
-        profile.emergency_fund += ef_transfer
-        profile.cash_on_hand   -= ef_transfer
-        _log(cycle, "cash_on_hand", "emergency_fund", ef_transfer)
-    cycle.emergency_fund_budget = ef_transfer
+    # Track how much NEW income we have to allocate (not existing cash_on_hand)
+    allocatable_amount = income
 
-    # Step 5 — reserve spendable budget from cash_on_hand
-    # The ₱10,000 (₱7k needs + ₱3k wants) stays in cash_on_hand as earmarked
-    # spending money. We deduct it now so later steps (rigs, savings) only
-    # allocate from what remains AFTER the user's living expenses are covered.
+    # Step 4 — reserve spendable budget FIRST (priority #1: needs + wants)
+    # The ₱10,000 (₱7k needs + ₱3k wants) is reserved for living expenses
     spendable = EXPENSES_BUDGET_NORMAL + WANTS_BUDGET_NORMAL   # ₱10,000
-    spendable_reserved = min(spendable, profile.cash_on_hand)
-    profile.cash_on_hand -= spendable_reserved
-    _log(cycle, "cash_on_hand", "spendable_budget", spendable_reserved)
-
+    spendable_reserved = min(spendable, allocatable_amount)
+    
     # Split the reserved amount proportionally if not enough for both
     if spendable_reserved >= spendable:
         cycle.expenses_budget = EXPENSES_BUDGET_NORMAL
@@ -134,30 +150,44 @@ def run_allocation_engine(
             Decimal("0.00"),
             spendable_reserved - cycle.expenses_budget,
         )
-
+    
     cycle.remaining_budget = cycle.expenses_budget + cycle.wants_budget
+    
+    # Deduct from allocatable amount (but keep in cash_on_hand for spending)
+    allocatable_amount -= spendable_reserved
+    _log(cycle, "cash_on_hand", "spendable_budget", spendable_reserved)
 
-    # Step 6 — rigs fund (up to ₱10,000 or whatever cash remains)
-    rigs_transfer = min(RIGS_FUND_CAP, profile.cash_on_hand)
+    # Step 5 — allocate ₱10,000 to emergency fund (priority #2)
+    # Emergency fund grows continuously as a safety net, no cap
+    # Only allocate if there's NEW income remaining after spendable budget
+    ef_transfer = min(EMERGENCY_FUND_ALLOCATION, allocatable_amount)
+    if ef_transfer > Decimal("0.00"):
+        profile.emergency_fund += ef_transfer
+        profile.cash_on_hand   -= ef_transfer
+        allocatable_amount     -= ef_transfer
+        _log(cycle, "cash_on_hand", "emergency_fund", ef_transfer)
+    cycle.emergency_fund_budget = ef_transfer
+
+    # Step 6 — rigs fund (up to ₱10,000 from remaining NEW income)
+    rigs_transfer = min(RIGS_FUND_CAP, allocatable_amount)
     if rigs_transfer > Decimal("0.00"):
-        profile.rigs_fund    += rigs_transfer
-        profile.cash_on_hand -= rigs_transfer
+        profile.rigs_fund      += rigs_transfer
+        profile.cash_on_hand   -= rigs_transfer
+        allocatable_amount     -= rigs_transfer
         _log(cycle, "cash_on_hand", "rigs_fund", rigs_transfer)
     cycle.rigs_fund_budget = rigs_transfer
 
-    # Step 7 — savings (up to ₱20,000 or whatever cash remains)
-    savings_transfer = min(SAVINGS_CAP, profile.cash_on_hand)
+    # Step 7 — savings (up to ₱20,000 from remaining NEW income)
+    savings_transfer = min(SAVINGS_CAP, allocatable_amount)
     if savings_transfer > Decimal("0.00"):
-        profile.savings      += savings_transfer
-        profile.cash_on_hand -= savings_transfer
+        profile.savings        += savings_transfer
+        profile.cash_on_hand   -= savings_transfer
+        allocatable_amount     -= savings_transfer
         _log(cycle, "cash_on_hand", "savings", savings_transfer)
     cycle.savings_budget = savings_transfer
 
-    # Whatever remains in cash_on_hand is genuinely unallocated liquid cash
-    # (covers the earmarked spendable + any leftover after all allocations)
-    # Add the reserved spendable back so cash_on_hand reflects the full
-    # amount the user can actually spend day-to-day.
-    profile.cash_on_hand += spendable_reserved
+    # Whatever remains from the NEW income stays in cash_on_hand
+    # (plus any existing cash_on_hand from previous months)
 
     profile.save()
     NetWorthSnapshot.capture(profile)

@@ -161,8 +161,8 @@ class IncomeView(APIView):
 
     Allocation order (normal mode):
         income → cash_on_hand
-             → emergency_fund  (₱10,000 per cycle, grows continuously)
-             → spendable reserved (₱10,000: ₱7k needs + ₱3k wants)
+             → spendable budget (₱10,000: ₱7k needs + ₱3k wants) — PRIORITY #1
+             → emergency_fund   (₱10,000 per cycle, grows continuously) — PRIORITY #2
              → rigs_fund        (up to ₱10,000)
              → savings          (up to ₱20,000)
              → remainder stays in cash_on_hand
