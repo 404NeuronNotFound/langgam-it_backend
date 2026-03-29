@@ -1,28 +1,40 @@
 # api/urls.py
 #
 # ┌──────────────────────────────────────────────────────────────────────────────┐
-# │  Method       │  URL                          │  Description                 │
-# ├───────────────┼───────────────────────────────┼──────────────────────────────┤
-# │  POST         │  /api/auth/register/           │  Create account              │
-# │  POST         │  /api/auth/token/              │  Login → get tokens          │
-# │  POST         │  /api/auth/token/refresh/      │  Refresh access token        │
-# │  GET          │  /api/auth/me/                 │  Get current user            │
-# ├───────────────┼───────────────────────────────┼──────────────────────────────┤
-# │  GET / PATCH  │  /api/finance/profile/         │  Financial profile           │
-# │  GET          │  /api/finance/snapshots/       │  Net worth history           │
-# │  GET          │  /api/finance/cycles/          │  Month cycle history         │
-# ├───────────────┼───────────────────────────────┼──────────────────────────────┤
-# │  POST         │  /api/income/                  │  Run allocation engine       │
-# │  POST         │  /api/invest/                  │  savings → investments       │
-# │  GET          │  /api/cycle/current/           │  Active cycle                │
+# │  Method        │  URL                          │  Description                │
+# ├────────────────┼───────────────────────────────┼─────────────────────────────┤
+# │  POST          │  /api/auth/register/           │  Create account             │
+# │  POST          │  /api/auth/token/              │  Login → get tokens         │
+# │  POST          │  /api/auth/token/refresh/      │  Refresh access token       │
+# │  GET           │  /api/auth/me/                 │  Get current user           │
+# ├────────────────┼───────────────────────────────┼─────────────────────────────┤
+# │  GET / PATCH   │  /api/finance/profile/         │  Financial profile          │
+# │  GET           │  /api/finance/snapshots/       │  Net worth history          │
+# │  GET           │  /api/finance/cycles/          │  Month cycle history        │
+# ├────────────────┼───────────────────────────────┼─────────────────────────────┤
+# │  POST          │  /api/income/                  │  Run allocation engine      │
+# │  POST          │  /api/invest/                  │  savings → investments      │
+# │  GET           │  /api/cycle/current/           │  Active cycle               │
+# ├────────────────┼───────────────────────────────┼─────────────────────────────┤
+# │  POST          │  /api/expenses/                │  Log expense                │
+# │  GET           │  /api/expenses/                │  List expenses              │
+# │  GET           │  /api/expenses/daily-limit/    │  Daily spending limit       │
+# ├────────────────┼───────────────────────────────┼─────────────────────────────┤
+# │  GET           │  /api/alerts/                  │  List unread alerts         │
+# │  PATCH         │  /api/alerts/<id>/read/        │  Mark alert as read         │
 # └──────────────────────────────────────────────────────────────────────────────┘
 
 from django.urls import path
 from rest_framework_simplejwt.views import TokenRefreshView
 
 from api.views import (
+    AlertListView,
+    AlertMarkReadView,
     CurrentMonthCycleView,
     CustomTokenObtainPairView,
+    DailyLimitView,
+    ExpenseListView,
+    ExpenseView,
     FinancialProfileView,
     IncomeView,
     InvestView,
@@ -50,4 +62,13 @@ urlpatterns = [
 
     # ── Active cycle ──────────────────────────────────────────────────────
     path("cycle/current/",      CurrentMonthCycleView.as_view(),     name="cycle-current"),
+
+    # ── Expenses ──────────────────────────────────────────────────────────
+    path("expenses/",            ExpenseView.as_view(),              name="expense-create"),
+    path("expenses/list/",       ExpenseListView.as_view(),          name="expense-list"),
+    path("expenses/daily-limit/",DailyLimitView.as_view(),          name="expense-daily-limit"),
+
+    # ── Alerts ────────────────────────────────────────────────────────────
+    path("alerts/",              AlertListView.as_view(),            name="alert-list"),
+    path("alerts/<int:pk>/read/",AlertMarkReadView.as_view(),        name="alert-mark-read"),
 ]
