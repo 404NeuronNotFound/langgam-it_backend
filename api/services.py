@@ -319,9 +319,10 @@ def run_monitoring_engine(
         expected_spend = (today_day / total_days_in_month) * total_budget
         IF actual_spend > expected_spend → ALERT overspend
 
-    Step 17 — Daily limit check
-        daily_limit = remaining_budget / remaining_days
-        IF today_spent > daily_limit → ALERT daily_limit
+    Step 17 — Daily limit check (flexible guideline)
+        daily_limit = remaining_budget / total_days_in_month
+        IF today_spent > (daily_limit * 2) → ALERT daily_limit
+        (Allows for big shopping days without constant alerts)
 
     Step 18 — Hard stop
         IF remaining_budget <= 0 → ALERT hard_stop
@@ -380,7 +381,8 @@ def run_monitoring_engine(
                 created_alerts.append(alert)
 
     # ── Step 17: Daily limit check ────────────────────────────────────────────
-    daily_limit = cycle.remaining_budget / Decimal(remaining_days)
+    # Use total days in month for flexible daily guideline
+    daily_limit = cycle.remaining_budget / Decimal(total_days) if total_days > 0 else Decimal("0.00")
 
     today_spent = (
         Expense.objects
@@ -389,15 +391,18 @@ def run_monitoring_engine(
     )
     today_spent = sum(today_spent, Decimal("0.00"))
 
-    if today_spent > daily_limit:
+    # Only alert if significantly over the flexible daily limit (e.g., 2x)
+    # This allows for big shopping days without constant alerts
+    if today_spent > (daily_limit * Decimal("2.0")):
         alert = _create_alert(
             user       = expense.user,
             cycle      = cycle,
             alert_type = Alert.TYPE_DAILY_LIMIT,
             message    = (
-                f"Daily limit exceeded. "
-                f"Today's limit: ₱{daily_limit:,.2f}. "
-                f"Today's spend: ₱{today_spent:,.2f}."
+                f"High spending day. "
+                f"Suggested daily limit: ₱{daily_limit:,.2f}. "
+                f"Today's spend: ₱{today_spent:,.2f}. "
+                f"Remember to balance with lighter spending days."
             ),
         )
         if alert:

@@ -440,14 +440,19 @@ class DailyLimitView(APIView):
     GET  /api/expenses/daily-limit/
 
     Formula:
-        remaining_days = total_days_in_month - today
-        daily_limit    = remaining_budget / remaining_days
+        total_days_in_month = days in current month (28-31)
+        daily_limit = remaining_budget / total_days_in_month
+        
+    This provides a flexible daily guideline rather than strict enforcement.
+    Users can spend more on some days (groceries, bills) and less on others.
+    The daily_limit adjusts as remaining_budget decreases.
 
     Success 200:
         {
             "daily_limit":     "333.33",
             "remaining_budget":"5000.00",
-            "remaining_days":  15,
+            "total_days":      30,
+            "days_passed":     15,
             "today_spent":     "450.00"
         }
 
@@ -471,8 +476,10 @@ class DailyLimitView(APIView):
 
         today          = timezone.localdate()
         total_days     = calendar.monthrange(today.year, today.month)[1]
-        remaining_days = max(1, total_days - today.day)
-        daily_limit    = cycle.remaining_budget / Decimal(remaining_days)
+        days_passed    = today.day
+        
+        # Daily limit based on total days in month (flexible guideline)
+        daily_limit    = cycle.remaining_budget / Decimal(total_days) if total_days > 0 else Decimal("0.00")
 
         # Total spent today
         today_spent = (
@@ -486,7 +493,8 @@ class DailyLimitView(APIView):
             {
                 "daily_limit":      round(daily_limit, 2),
                 "remaining_budget": cycle.remaining_budget,
-                "remaining_days":   remaining_days,
+                "total_days":       total_days,
+                "days_passed":      days_passed,
                 "today_spent":      today_spent,
             },
             status=status.HTTP_200_OK,
