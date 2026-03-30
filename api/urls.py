@@ -42,6 +42,7 @@ from api.views import (
     MonthCycleListView,
     NetWorthSnapshotListView,
     RegisterView,
+    ResetExpensesView,
 )
 
 urlpatterns = [
@@ -61,7 +62,9 @@ urlpatterns = [
     path("invest/",             InvestView.as_view(),                name="invest"),
 
     # ── Active cycle ──────────────────────────────────────────────────────
-    path("cycle/current/",      CurrentMonthCycleView.as_view(),     name="cycle-current"),
+    path("cycle/current/",              CurrentMonthCycleView.as_view(),     name="cycle-current"),
+    path("cycle/current/reset-expenses/", ResetExpensesView.as_view(),       name="cycle-reset-expenses"),
+    path("cycle/reset-expenses/",       ResetExpensesView.as_view(),         name="cycle-reset-expenses-alias"),
 
     # ── Expenses ──────────────────────────────────────────────────────────
     path("expenses/",            ExpenseView.as_view(),              name="expense-create"),

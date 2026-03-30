@@ -5,6 +5,7 @@ from datetime import date
 from decimal import Decimal
 
 from django.contrib.auth.models import User
+from django.db import models
 from django.utils import timezone
 from rest_framework import generics, permissions, status
 from rest_framework.response import Response
@@ -174,10 +175,6 @@ class IncomeView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def post(self, request):
-        now   = timezone.now()
-        year  = int(request.data.get("year",  now.year))
-        month = int(request.data.get("month", now.month))
-
         # Accept either "income" or "amount" as the income field name
         raw = request.data.get("income") or request.data.get("amount") or "0"
         try:
@@ -196,16 +193,41 @@ class IncomeView(APIView):
 
         profile, _ = FinancialProfile.objects.get_or_create(user=request.user)
 
-        cycle, created = MonthCycle.objects.get_or_create(
+        # Close ALL previous active cycles (each income creates a new cycle)
+        MonthCycle.objects.filter(
+            user=request.user,
+            status=MonthCycle.STATUS_ACTIVE
+        ).update(status=MonthCycle.STATUS_CLOSED)
+
+        # Get the last cycle to determine next month/year
+        last_cycle = (
+            MonthCycle.objects
+            .filter(user=request.user)
+            .order_by("-year", "-month")
+            .first()
+        )
+
+        if last_cycle:
+            # Increment month, handle year rollover
+            year = last_cycle.year
+            month = last_cycle.month + 1
+            if month > 12:
+                month = 1
+                year += 1
+        else:
+            # First cycle ever - use current date
+            now = timezone.now()
+            year = now.year
+            month = now.month
+
+        # Create a NEW cycle with incremented month
+        cycle = MonthCycle.objects.create(
             user=request.user,
             year=year,
             month=month,
-            defaults={"income": income},
+            income=income,
+            status=MonthCycle.STATUS_ACTIVE,
         )
-
-        if not created:
-            # Re-running this month: clear prior allocation logs and reset cycle
-            cycle.allocation_logs.all().delete()
 
         # Refresh profile from database to ensure we have the latest values
         profile.refresh_from_db()
@@ -298,9 +320,14 @@ class MonthCycleListView(generics.ListAPIView):
 
 class CurrentMonthCycleView(APIView):
     """
-    Return the most recent active MonthCycle.
+    Return the most recent active MonthCycle with calculated remaining amounts.
 
     Returns 404 if no active cycle exists (user has not submitted income yet).
+    
+    Response includes:
+        - All cycle fields from MonthCycleSerializer
+        - needs_remaining: expenses_budget - (total needs expenses)
+        - wants_remaining: wants_budget - (total wants expenses)
     """
 
     permission_classes = [permissions.IsAuthenticated]
@@ -318,10 +345,31 @@ class CurrentMonthCycleView(APIView):
                 {"detail": "No active cycle. Submit income via POST /api/income/."},
                 status=status.HTTP_404_NOT_FOUND,
             )
-        return Response(
-            MonthCycleSerializer(cycle).data,
-            status=status.HTTP_200_OK,
+        
+        # Calculate remaining amounts for each category
+        needs_spent = (
+            Expense.objects
+            .filter(cycle=cycle, category=Expense.CATEGORY_NEEDS)
+            .aggregate(total=models.Sum("amount"))["total"] or Decimal("0.00")
         )
+        
+        wants_spent = (
+            Expense.objects
+            .filter(cycle=cycle, category=Expense.CATEGORY_WANTS)
+            .aggregate(total=models.Sum("amount"))["total"] or Decimal("0.00")
+        )
+        
+        needs_remaining = cycle.expenses_budget - needs_spent
+        wants_remaining = cycle.wants_budget - wants_spent
+        
+        # Serialize cycle data and add remaining amounts
+        data = MonthCycleSerializer(cycle).data
+        data["needs_remaining"] = needs_remaining
+        data["wants_remaining"] = wants_remaining
+        data["needs_spent"] = needs_spent
+        data["wants_spent"] = wants_spent
+        
+        return Response(data, status=status.HTTP_200_OK)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -600,3 +648,81 @@ class AlertMarkReadView(APIView):
         alert.is_read = True
         alert.save(update_fields=["is_read"])
         return Response(AlertSerializer(alert).data, status=status.HTTP_200_OK)
+
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 15. Reset Expenses  →  POST /api/cycle/current/reset-expenses/
+# ──────────────────────────────────────────────────────────────────────
+
+class ResetExpensesView(APIView):
+    """
+    Delete all expenses from the current active cycle and restore budgets.
+    
+    POST  /api/cycle/current/reset-expenses/
+    
+    This will:
+    - Delete all expenses from the current cycle
+    - Restore remaining_budget to full amount (expenses_budget + wants_budget)
+    - Restore cash_on_hand by adding back all spent amounts
+    - Recalculate net worth snapshot
+    
+    Success 200:
+        {
+            "message": "Expenses reset successfully",
+            "deleted_count": 6,
+            "cycle": { ... },
+            "profile": { ... }
+        }
+    
+    404 if no active cycle exists.
+    """
+    
+    permission_classes = [permissions.IsAuthenticated]
+    
+    def post(self, request):
+        # Get active cycle
+        cycle = (
+            MonthCycle.objects
+            .filter(user=request.user, status=MonthCycle.STATUS_ACTIVE)
+            .order_by("-year", "-month")
+            .first()
+        )
+        
+        if cycle is None:
+            return Response(
+                {"error": "No active cycle. Submit income via POST /api/income/ first."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        
+        profile, _ = FinancialProfile.objects.get_or_create(user=request.user)
+        
+        # Calculate total spent in this cycle
+        expenses = Expense.objects.filter(cycle=cycle)
+        total_spent = sum(expense.amount for expense in expenses)
+        expense_count = expenses.count()
+        
+        # Delete all expenses
+        expenses.delete()
+        
+        # Restore remaining_budget to full amount
+        cycle.remaining_budget = cycle.expenses_budget + cycle.wants_budget
+        cycle.save()
+        
+        # Restore cash_on_hand
+        profile.cash_on_hand += total_spent
+        profile.save()
+        
+        # Capture updated net worth
+        NetWorthSnapshot.capture(profile)
+        
+        return Response(
+            {
+                "message": "Expenses reset successfully",
+                "deleted_count": expense_count,
+                "total_restored": total_spent,
+                "cycle": MonthCycleSerializer(cycle).data,
+                "profile": FinancialProfileSerializer(profile).data,
+            },
+            status=status.HTTP_200_OK,
+        )

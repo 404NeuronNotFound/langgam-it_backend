@@ -235,33 +235,30 @@ def run_expense(
     expense: Expense,
 ) -> list["Alert"]:
     """
-    Steps 14 & 15 — Deduct an expense from the correct budget bucket
-    and from cash_on_hand, then run the AI monitoring engine.
+    Steps 14 & 15 — Deduct an expense from remaining_budget and cash_on_hand,
+    then run the AI monitoring engine.
 
     Deduction rules
     ---------------
-    needs  → expenses_budget -= amount
-    wants  → wants_budget    -= amount
-    both   → remaining_budget -= amount
-             cash_on_hand     -= amount  (actual money leaves the wallet)
-
-    Budget buckets are allowed to go negative — this reflects overspending
-    reality and lets the monitoring engine catch it rather than hard-blocking.
+    remaining_budget -= amount  (tracks what's left to spend)
+    cash_on_hand     -= amount  (actual money leaves the wallet)
+    
+    Note: expenses_budget and wants_budget stay at their allocated values
+    (7k and 3k). They represent the ALLOCATED amounts, not remaining amounts.
+    To see what's left in each category, calculate:
+        needs_remaining = expenses_budget - (total needs expenses)
+        wants_remaining = wants_budget - (total wants expenses)
 
     Returns a list of Alert objects created by the monitoring engine.
     """
     amount = expense.amount
 
-    # Step 14 — deduct from the correct category bucket
-    if expense.category == Expense.CATEGORY_NEEDS:
-        cycle.expenses_budget -= amount
-    else:
-        cycle.wants_budget -= amount
-
-    # Step 15 — deduct from totals
+    # Step 14 — deduct from remaining_budget only
+    # (expenses_budget and wants_budget stay at allocated values)
     cycle.remaining_budget -= amount
     cycle.save()
 
+    # Step 15 — deduct from cash_on_hand (actual money spent)
     profile.cash_on_hand -= amount
     profile.save()
 
