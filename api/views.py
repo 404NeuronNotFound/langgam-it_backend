@@ -1045,3 +1045,101 @@ class ReportsView(APIView):
             },
             status=status.HTTP_200_OK,
         )
+
+# ──────────────────────────────────────────────────────────────────────
+# Divest  →  POST /api/divest/
+# ──────────────────────────────────────────────────────────────────────
+ 
+from .services import run_divest  # noqa: E402
+ 
+ 
+class DivestView(APIView):
+    """
+    Move funds from investments_total → savings (reverse of invest).
+ 
+    POST  /api/divest/
+        { "amount": "5000.00" }
+    """
+ 
+    permission_classes = [permissions.IsAuthenticated]
+ 
+    def post(self, request):
+        try:
+            amount = Decimal(str(request.data.get("amount", "0")))
+        except Exception:
+            return Response({"error": "Invalid amount value."}, status=status.HTTP_400_BAD_REQUEST)
+ 
+        cycle = (
+            MonthCycle.objects
+            .filter(user=request.user, status=MonthCycle.STATUS_ACTIVE)
+            .order_by("-year", "-month")
+            .first()
+        )
+        if cycle is None:
+            return Response(
+                {"error": "No active month cycle. Call POST /api/income/ first."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+ 
+        profile, _ = FinancialProfile.objects.get_or_create(user=request.user)
+ 
+        try:
+            profile = run_divest(profile, cycle, amount)
+        except ValueError as exc:
+            return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+ 
+        return Response({"profile": FinancialProfileSerializer(profile).data}, status=status.HTTP_200_OK)
+ 
+ 
+# ──────────────────────────────────────────────────────────────────────
+# Investment CRUD  →  /api/investments/
+# ──────────────────────────────────────────────────────────────────────
+ 
+from .models import Investment 
+from .serializers import InvestmentSerializer  
+ 
+ 
+class InvestmentListCreateView(generics.ListCreateAPIView):
+    """
+    GET   /api/investments/   — list all investments for the user
+    POST  /api/investments/   — create a new investment record
+ 
+    On create, the post_save signal fires sync_investments_total automatically.
+    The FinancialProfile.investments_total becomes the sum of all Investment.current_value.
+ 
+    Request body (POST):
+        {
+            "name":           "BDO Stock",
+            "type":           "stocks",
+            "total_invested": "10000.00",
+            "current_value":  "12000.00"
+        }
+    """
+ 
+    serializer_class   = InvestmentSerializer
+    permission_classes = [permissions.IsAuthenticated]
+ 
+    def get_queryset(self):
+        return Investment.objects.filter(user=self.request.user)
+ 
+    def perform_create(self, serializer):
+        # Signal handles sync — just save with the user
+        serializer.save(user=self.request.user)
+ 
+ 
+class InvestmentDetailView(generics.RetrieveUpdateDestroyAPIView):
+    """
+    GET    /api/investments/<id>/   — retrieve one investment
+    PATCH  /api/investments/<id>/   — update current_value or other fields
+    DELETE /api/investments/<id>/   — delete; signal re-syncs investments_total
+    """
+ 
+    serializer_class   = InvestmentSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    http_method_names  = ["get", "patch", "delete", "head", "options"]
+ 
+    def get_queryset(self):
+        return Investment.objects.filter(user=self.request.user)
+ 
+    # Signal handles sync on save and delete — no extra code needed here
+ 
