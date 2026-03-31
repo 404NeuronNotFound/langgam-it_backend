@@ -227,6 +227,40 @@ def run_invest(
     return profile
 
 
+def run_divest(
+    profile: FinancialProfile,
+    cycle: MonthCycle,
+    amount: Decimal,
+) -> FinancialProfile:
+    """
+    Move `amount` from investments_total → savings (reverse of invest).
+
+    Raises ValueError if the amount is non-positive or exceeds available investments.
+    Logs the transfer and captures a NetWorthSnapshot.
+    
+    Note: This moves money from the investments_total pool back to savings.
+    Individual Investment records should be updated separately to reflect
+    which specific assets were sold.
+    """
+    if amount <= Decimal("0.00"):
+        raise ValueError("Divestment amount must be positive.")
+
+    if amount > profile.investments_total:
+        raise ValueError(
+            f"Insufficient investments. "
+            f"Available: ₱{profile.investments_total:,.2f}, requested: ₱{amount:,.2f}."
+        )
+
+    profile.investments_total -= amount
+    profile.savings           += amount
+    profile.save()
+
+    _log(cycle, "investments_total", "savings", amount)
+    NetWorthSnapshot.capture(profile)
+
+    return profile
+
+
 # ── Expense engine ────────────────────────────────────────────────────────────
 
 def run_expense(

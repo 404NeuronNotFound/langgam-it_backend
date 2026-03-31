@@ -30,18 +30,23 @@ from rest_framework_simplejwt.views import TokenRefreshView
 from api.views import (
     AlertListView,
     AlertMarkReadView,
+    CloseMonthView,
     CurrentMonthCycleView,
     CustomTokenObtainPairView,
     DailyLimitView,
+    DivestView,
     ExpenseListView,
     ExpenseView,
     FinancialProfileView,
     IncomeView,
+    InvestmentDetailView,
+    InvestmentListCreateView,
     InvestView,
     MeView,
     MonthCycleListView,
     NetWorthSnapshotListView,
     RegisterView,
+    ReportsView,
     ResetExpensesView,
 )
 
@@ -60,6 +65,7 @@ urlpatterns = [
     # ── Allocation engine ─────────────────────────────────────────────────
     path("income/",             IncomeView.as_view(),                name="income"),
     path("invest/",             InvestView.as_view(),                name="invest"),
+    path("divest/",             DivestView.as_view(),                name="divest"),
 
     # ── Active cycle ──────────────────────────────────────────────────────
     path("cycle/current/",              CurrentMonthCycleView.as_view(),     name="cycle-current"),
@@ -74,4 +80,14 @@ urlpatterns = [
     # ── Alerts ────────────────────────────────────────────────────────────
     path("alerts/",              AlertListView.as_view(),            name="alert-list"),
     path("alerts/<int:pk>/read/",AlertMarkReadView.as_view(),        name="alert-mark-read"),
+
+    # ── Investments ───────────────────────────────────────────────────────
+    path("investments/",         InvestmentListCreateView.as_view(), name="investment-list-create"),
+    path("investments/<int:pk>/",InvestmentDetailView.as_view(),     name="investment-detail"),
+
+    # ── Month Management ──────────────────────────────────────────────────
+    path("month/close/",         CloseMonthView.as_view(),           name="month-close"),
+
+    # ── Reports ───────────────────────────────────────────────────────────
+    path("reports/",             ReportsView.as_view(),              name="reports"),
 ]

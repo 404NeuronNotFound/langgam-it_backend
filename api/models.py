@@ -60,6 +60,24 @@ class FinancialProfile(models.Model):
             + self.cash_on_hand
             + self.investments_total
         )
+    
+    def sync_investments_total(self) -> Decimal:
+        """
+        Sync investments_total with the sum of all Investment.current_value.
+        
+        This should be called whenever an Investment is created, updated, or deleted
+        to keep the FinancialProfile.investments_total in sync.
+        
+        Returns the new investments_total value.
+        """
+        from django.db.models import Sum
+        total = (
+            self.user.investments.aggregate(total=Sum("current_value"))["total"]
+            or Decimal("0.00")
+        )
+        self.investments_total = total
+        self.save(update_fields=["investments_total"])
+        return total
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -370,3 +388,208 @@ class Alert(models.Model):
             f"{self.type}, "
             f"read={self.is_read})"
         )
+
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 7. Investment  (individual asset records)
+# ──────────────────────────────────────────────────────────────────────
+
+class Investment(models.Model):
+    """
+    Represents an individual investment asset owned by a user.
+    
+    Tracks the investment details including amount invested and current value.
+    The profit/loss is computed dynamically based on current_value - total_invested.
+    
+    Fields
+    ------
+    name            — name of the investment (e.g., "BDO Stock", "Bitcoin")
+    type            — category of investment (stocks, crypto, bonds, etc.)
+    total_invested  — total amount invested (cost basis)
+    current_value   — current market value of the investment
+    profit_loss     — computed property: current_value - total_invested
+    """
+    
+    TYPE_STOCKS = "stocks"
+    TYPE_CRYPTO = "crypto"
+    TYPE_BONDS = "bonds"
+    TYPE_MUTUAL_FUNDS = "mutual_funds"
+    TYPE_REAL_ESTATE = "real_estate"
+    TYPE_OTHER = "other"
+    
+    TYPE_CHOICES = [
+        (TYPE_STOCKS, "Stocks"),
+        (TYPE_CRYPTO, "Cryptocurrency"),
+        (TYPE_BONDS, "Bonds"),
+        (TYPE_MUTUAL_FUNDS, "Mutual Funds"),
+        (TYPE_REAL_ESTATE, "Real Estate"),
+        (TYPE_OTHER, "Other"),
+    ]
+    
+    user = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name="investments",
+    )
+    
+    name            = models.CharField(max_length=255)
+    type            = models.CharField(max_length=20, choices=TYPE_CHOICES, default=TYPE_OTHER)
+    total_invested  = models.DecimalField(max_digits=14, decimal_places=2, default=Decimal("0.00"))
+    current_value   = models.DecimalField(max_digits=14, decimal_places=2, default=Decimal("0.00"))
+    
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        verbose_name        = "Investment"
+        verbose_name_plural = "Investments"
+        ordering            = ["-created_at"]
+    
+    def __str__(self) -> str:
+        return f"Investment({self.user.username}, {self.name}, {self.type})"
+    
+    @property
+    def profit_loss(self) -> Decimal:
+        """
+        Computed profit or loss for this investment.
+        Positive = profit, Negative = loss
+        """
+        return self.current_value - self.total_invested
+    
+    @property
+    def profit_loss_percentage(self) -> Decimal:
+        """
+        Computed profit/loss as a percentage of total invested.
+        Returns 0 if total_invested is 0 to avoid division by zero.
+        """
+        if self.total_invested == Decimal("0.00"):
+            return Decimal("0.00")
+        return (self.profit_loss / self.total_invested) * Decimal("100.00")
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 8. MonthSummary  (end-of-month snapshot)
+# ──────────────────────────────────────────────────────────────────────
+
+class MonthSummary(models.Model):
+    """
+    End-of-month summary snapshot for a user's financial activity.
+    
+    Created automatically when a cycle is closed (status='closed').
+    Provides a high-level overview of the month's financial activity.
+    
+    Fields
+    ------
+    cycle                   — link to the MonthCycle this summary represents
+    total_income            — income for the month (from cycle.income)
+    total_expenses          — sum of all expenses in the cycle
+    total_saved             — amount allocated to savings + emergency fund + rigs fund
+    remaining_carried_over  — unspent budget carried to next month (cash_on_hand at cycle end)
+    net_worth_start         — net worth at start of cycle
+    net_worth_end           — net worth at end of cycle
+    net_worth_change        — computed: net_worth_end - net_worth_start
+    """
+    
+    user = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name="month_summaries",
+    )
+    
+    cycle = models.OneToOneField(
+        MonthCycle,
+        on_delete=models.CASCADE,
+        related_name="summary",
+    )
+    
+    # Financial activity for the month
+    total_income            = models.DecimalField(max_digits=14, decimal_places=2, default=Decimal("0.00"))
+    total_expenses          = models.DecimalField(max_digits=14, decimal_places=2, default=Decimal("0.00"))
+    total_saved             = models.DecimalField(max_digits=14, decimal_places=2, default=Decimal("0.00"))
+    remaining_carried_over  = models.DecimalField(max_digits=14, decimal_places=2, default=Decimal("0.00"))
+    
+    # Net worth tracking
+    net_worth_start  = models.DecimalField(max_digits=14, decimal_places=2, default=Decimal("0.00"))
+    net_worth_end    = models.DecimalField(max_digits=14, decimal_places=2, default=Decimal("0.00"))
+    
+    created_at = models.DateTimeField(auto_now_add=True)
+    
+    class Meta:
+        verbose_name        = "Month Summary"
+        verbose_name_plural = "Month Summaries"
+        ordering            = ["-cycle__year", "-cycle__month"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["user", "cycle"],
+                name="unique_user_cycle_summary",
+            )
+        ]
+    
+    def __str__(self) -> str:
+        return (
+            f"MonthSummary("
+            f"{self.user.username}, "
+            f"{self.cycle.year}-{self.cycle.month:02d})"
+        )
+    
+    @property
+    def net_worth_change(self) -> Decimal:
+        """Computed change in net worth for this month."""
+        return self.net_worth_end - self.net_worth_start
+    
+    @classmethod
+    def create_from_cycle(cls, cycle: MonthCycle) -> "MonthSummary":
+        """
+        Create a MonthSummary from a closed cycle.
+        
+        Calculates all summary fields based on the cycle's data and related expenses.
+        Should be called when a cycle is closed.
+        """
+        # Calculate total expenses for this cycle
+        total_expenses = (
+            Expense.objects
+            .filter(cycle=cycle)
+            .aggregate(total=models.Sum("amount"))["total"] or Decimal("0.00")
+        )
+        
+        # Calculate total saved (emergency fund + rigs fund + savings allocated)
+        total_saved = (
+            cycle.emergency_fund_budget +
+            cycle.rigs_fund_budget +
+            cycle.savings_budget
+        )
+        
+        # Get net worth snapshots for this cycle
+        snapshots = (
+            NetWorthSnapshot.objects
+            .filter(user=cycle.user)
+            .order_by("captured_at")
+        )
+        
+        # Find snapshots around the cycle creation time
+        cycle_start_snapshot = snapshots.filter(captured_at__lte=cycle.created_at).last()
+        cycle_end_snapshot = snapshots.filter(captured_at__gte=cycle.created_at).last()
+        
+        net_worth_start = cycle_start_snapshot.net_worth if cycle_start_snapshot else Decimal("0.00")
+        net_worth_end = cycle_end_snapshot.net_worth if cycle_end_snapshot else Decimal("0.00")
+        
+        # Get current cash_on_hand as remaining carried over
+        profile = cycle.user.financial_profile
+        remaining_carried_over = profile.cash_on_hand
+        
+        # Create or update the summary
+        summary, created = cls.objects.update_or_create(
+            user=cycle.user,
+            cycle=cycle,
+            defaults={
+                "total_income": cycle.income,
+                "total_expenses": total_expenses,
+                "total_saved": total_saved,
+                "remaining_carried_over": remaining_carried_over,
+                "net_worth_start": net_worth_start,
+                "net_worth_end": net_worth_end,
+            }
+        )
+        
+        return summary

@@ -12,18 +12,20 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework_simplejwt.views import TokenObtainPairView
 
-from .models import Alert, Expense, FinancialProfile, MonthCycle, NetWorthSnapshot
+from .models import Alert, Expense, FinancialProfile, MonthCycle, NetWorthSnapshot, Investment, MonthSummary
 from .serializers import (
     AlertSerializer,
     CustomTokenObtainPairSerializer,
     ExpenseSerializer,
     FinancialProfileSerializer,
+    InvestmentSerializer,
     MonthCycleSerializer,
+    MonthSummarySerializer,
     NetWorthSnapshotSerializer,
     RegisterSerializer,
     UserSerializer,
 )
-from .services import run_allocation_engine, run_expense, run_invest
+from .services import run_allocation_engine, run_expense, run_invest, run_divest
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -287,6 +289,59 @@ class InvestView(APIView):
 
         try:
             profile = run_invest(profile, cycle, amount)
+        except ValueError as exc:
+            return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response(
+            {"profile": FinancialProfileSerializer(profile).data},
+            status=status.HTTP_200_OK,
+        )
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 8. Divest  →  POST /api/divest/
+# ──────────────────────────────────────────────────────────────────────
+
+class DivestView(APIView):
+    """
+    Move funds from investments_total → savings (reverse of invest).
+
+    POST  /api/divest/
+        { "amount": "5000.00" }
+
+    Requires an active MonthCycle (call POST /api/income/ first).
+
+    Success 200:
+        { "profile": { ... } }
+    """
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        try:
+            amount = Decimal(str(request.data.get("amount", "0")))
+        except Exception:
+            return Response(
+                {"error": "Invalid amount value."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        cycle = (
+            MonthCycle.objects
+            .filter(user=request.user, status=MonthCycle.STATUS_ACTIVE)
+            .order_by("-year", "-month")
+            .first()
+        )
+        if cycle is None:
+            return Response(
+                {"error": "No active month cycle. Call POST /api/income/ first."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        profile, _ = FinancialProfile.objects.get_or_create(user=request.user)
+
+        try:
+            profile = run_divest(profile, cycle, amount)
         except ValueError as exc:
             return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -723,6 +778,270 @@ class ResetExpensesView(APIView):
                 "total_restored": total_spent,
                 "cycle": MonthCycleSerializer(cycle).data,
                 "profile": FinancialProfileSerializer(profile).data,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 16. Investments CRUD  →  /api/investments/
+# ──────────────────────────────────────────────────────────────────────
+
+class InvestmentListCreateView(generics.ListCreateAPIView):
+    """
+    List all investments or create a new investment.
+    
+    GET  /api/investments/
+    POST /api/investments/
+    
+    Request body (POST):
+        {
+            "name": "BDO Stock",
+            "type": "stocks",
+            "total_invested": "10000.00",
+            "current_value": "12000.00"
+        }
+    
+    When creating an investment, the FinancialProfile.investments_total
+    is automatically synced with the sum of all investments.
+    """
+    
+    serializer_class = InvestmentSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    
+    def get_queryset(self):
+        return Investment.objects.filter(user=self.request.user)
+    
+    def perform_create(self, serializer):
+        investment = serializer.save(user=self.request.user)
+        
+        # Sync investments_total in FinancialProfile
+        profile, _ = FinancialProfile.objects.get_or_create(user=self.request.user)
+        profile.sync_investments_total()
+        
+        # Capture net worth snapshot
+        NetWorthSnapshot.capture(profile)
+
+
+class InvestmentDetailView(generics.RetrieveUpdateDestroyAPIView):
+    """
+    Retrieve, update, or delete a specific investment.
+    
+    GET    /api/investments/<id>/
+    PUT    /api/investments/<id>/
+    PATCH  /api/investments/<id>/
+    DELETE /api/investments/<id>/
+    
+    When updating or deleting, the FinancialProfile.investments_total
+    is automatically synced.
+    """
+    
+    serializer_class = InvestmentSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    
+    def get_queryset(self):
+        return Investment.objects.filter(user=self.request.user)
+    
+    def perform_update(self, serializer):
+        serializer.save()
+        
+        # Sync investments_total in FinancialProfile
+        profile, _ = FinancialProfile.objects.get_or_create(user=self.request.user)
+        profile.sync_investments_total()
+        
+        # Capture net worth snapshot
+        NetWorthSnapshot.capture(profile)
+    
+    def perform_destroy(self, instance):
+        user = instance.user
+        instance.delete()
+        
+        # Sync investments_total in FinancialProfile
+        profile, _ = FinancialProfile.objects.get_or_create(user=user)
+        profile.sync_investments_total()
+        
+        # Capture net worth snapshot
+        NetWorthSnapshot.capture(profile)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 17. Close Month  →  POST /api/month/close/
+# ──────────────────────────────────────────────────────────────────────
+
+class CloseMonthView(APIView):
+    """
+    End-of-month engine: close current cycle and create summary.
+    
+    POST  /api/month/close/
+    
+    Steps 22-25:
+        22. Create MonthSummary from current cycle
+        23. Move remaining_budget to cash_on_hand (already there)
+        24. Move excess cash to savings (optional)
+        25. Close cycle (status='closed')
+        26. Recalculate net worth snapshot
+    
+    Success 200:
+        {
+            "message": "Month closed successfully",
+            "summary": { ... },
+            "profile": { ... }
+        }
+    """
+    
+    permission_classes = [permissions.IsAuthenticated]
+    
+    def post(self, request):
+        # Get active cycle
+        cycle = (
+            MonthCycle.objects
+            .filter(user=request.user, status=MonthCycle.STATUS_ACTIVE)
+            .order_by("-year", "-month")
+            .first()
+        )
+        
+        if cycle is None:
+            return Response(
+                {"error": "No active cycle to close."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        
+        profile, _ = FinancialProfile.objects.get_or_create(user=request.user)
+        
+        # Step 22 — Create MonthSummary
+        summary = MonthSummary.create_from_cycle(cycle)
+        
+        # Step 23 — Remaining budget is already in cash_on_hand
+        # (no action needed, it's already there)
+        
+        # Step 24 — Optional: Move excess cash to savings
+        # Get user preference for auto-save threshold (default: keep all in cash)
+        auto_save_threshold = request.data.get("auto_save_threshold")
+        if auto_save_threshold:
+            try:
+                threshold = Decimal(str(auto_save_threshold))
+                if profile.cash_on_hand > threshold:
+                    excess = profile.cash_on_hand - threshold
+                    profile.cash_on_hand -= excess
+                    profile.savings += excess
+                    profile.save()
+            except (ValueError, TypeError):
+                pass  # Invalid threshold, skip auto-save
+        
+        # Step 25 — Close the cycle
+        cycle.status = MonthCycle.STATUS_CLOSED
+        cycle.save()
+        
+        # Step 26 — Recalculate net worth snapshot
+        NetWorthSnapshot.capture(profile)
+        
+        return Response(
+            {
+                "message": "Month closed successfully",
+                "summary": MonthSummarySerializer(summary).data,
+                "profile": FinancialProfileSerializer(profile).data,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 18. Reports  →  GET /api/reports/
+# ──────────────────────────────────────────────────────────────────────
+
+class ReportsView(APIView):
+    """
+    Monthly summary history and charts data.
+    
+    GET  /api/reports/
+    
+    Query params:
+        - months: number of months to include (default: 12)
+        - year: filter by specific year (optional)
+    
+    Success 200:
+        {
+            "summaries": [ ... ],
+            "charts": {
+                "income_trend": [ ... ],
+                "expense_trend": [ ... ],
+                "savings_trend": [ ... ],
+                "net_worth_trend": [ ... ]
+            },
+            "totals": {
+                "total_income": "120000.00",
+                "total_expenses": "80000.00",
+                "total_saved": "40000.00"
+            }
+        }
+    """
+    
+    permission_classes = [permissions.IsAuthenticated]
+    
+    def get(self, request):
+        # Get query parameters
+        months = int(request.query_params.get("months", 12))
+        year = request.query_params.get("year")
+        
+        # Build queryset
+        summaries_qs = MonthSummary.objects.filter(user=request.user)
+        
+        if year:
+            summaries_qs = summaries_qs.filter(cycle__year=int(year))
+        
+        summaries_qs = summaries_qs.order_by("-cycle__year", "-cycle__month")[:months]
+        summaries = list(summaries_qs)
+        
+        # Serialize summaries
+        summaries_data = MonthSummarySerializer(summaries, many=True).data
+        
+        # Prepare chart data (reverse order for chronological display)
+        summaries_reversed = list(reversed(summaries))
+        
+        charts = {
+            "income_trend": [
+                {
+                    "month": f"{s.cycle.year}-{s.cycle.month:02d}",
+                    "value": float(s.total_income)
+                }
+                for s in summaries_reversed
+            ],
+            "expense_trend": [
+                {
+                    "month": f"{s.cycle.year}-{s.cycle.month:02d}",
+                    "value": float(s.total_expenses)
+                }
+                for s in summaries_reversed
+            ],
+            "savings_trend": [
+                {
+                    "month": f"{s.cycle.year}-{s.cycle.month:02d}",
+                    "value": float(s.total_saved)
+                }
+                for s in summaries_reversed
+            ],
+            "net_worth_trend": [
+                {
+                    "month": f"{s.cycle.year}-{s.cycle.month:02d}",
+                    "value": float(s.net_worth_end)
+                }
+                for s in summaries_reversed
+            ],
+        }
+        
+        # Calculate totals
+        totals = {
+            "total_income": sum(s.total_income for s in summaries),
+            "total_expenses": sum(s.total_expenses for s in summaries),
+            "total_saved": sum(s.total_saved for s in summaries),
+        }
+        
+        return Response(
+            {
+                "summaries": summaries_data,
+                "charts": charts,
+                "totals": totals,
             },
             status=status.HTTP_200_OK,
         )

@@ -5,7 +5,7 @@ from django.contrib.auth.password_validation import validate_password
 from rest_framework import serializers
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 
-from .models import AllocationLog, FinancialProfile, MonthCycle, NetWorthSnapshot, Alert, Expense
+from .models import AllocationLog, FinancialProfile, MonthCycle, NetWorthSnapshot, Alert, Expense, Investment, MonthSummary
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -271,3 +271,75 @@ class AlertSerializer(serializers.ModelSerializer):
             "is_read",
             "created_at",
         ]
+
+class InvestmentSerializer(serializers.ModelSerializer):
+    """
+    Serializer for Investment model with computed profit/loss fields.
+    
+    Read-only computed fields:
+        - profit_loss: current_value - total_invested
+        - profit_loss_percentage: (profit_loss / total_invested) * 100
+    """
+    
+    profit_loss = serializers.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        read_only=True,
+    )
+    
+    profit_loss_percentage = serializers.DecimalField(
+        max_digits=8,
+        decimal_places=2,
+        read_only=True,
+    )
+    
+    class Meta:
+        model = Investment
+        fields = [
+            "id",
+            "name",
+            "type",
+            "total_invested",
+            "current_value",
+            "profit_loss",
+            "profit_loss_percentage",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["id", "profit_loss", "profit_loss_percentage", "created_at", "updated_at"]
+
+
+class MonthSummarySerializer(serializers.ModelSerializer):
+    """
+    Serializer for MonthSummary model with computed net worth change.
+    
+    Includes cycle details and computed fields for financial overview.
+    """
+    
+    net_worth_change = serializers.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        read_only=True,
+    )
+    
+    # Include basic cycle info
+    cycle_year = serializers.IntegerField(source="cycle.year", read_only=True)
+    cycle_month = serializers.IntegerField(source="cycle.month", read_only=True)
+    
+    class Meta:
+        model = MonthSummary
+        fields = [
+            "id",
+            "cycle",
+            "cycle_year",
+            "cycle_month",
+            "total_income",
+            "total_expenses",
+            "total_saved",
+            "remaining_carried_over",
+            "net_worth_start",
+            "net_worth_end",
+            "net_worth_change",
+            "created_at",
+        ]
+        read_only_fields = fields  # All fields are read-only (generated from cycle data)
