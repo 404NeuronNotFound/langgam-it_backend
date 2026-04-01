@@ -804,8 +804,13 @@ class InvestmentListCreateView(generics.ListCreateAPIView):
             "current_value": "12000.00"
         }
     
-    When creating an investment, the FinancialProfile.investments_total
+    When creating an investment, validates that total_invested doesn't exceed
+    the allocated investment budget. The FinancialProfile.investments_total
     is automatically synced with the sum of all investments.
+    
+    Validation:
+        - Sum of all Investment.total_invested must not exceed InvestmentAllocation.total_allocated
+        - If user wants to add more investments, they must transfer funds from savings first
     """
     
     serializer_class = InvestmentSerializer
@@ -813,6 +818,42 @@ class InvestmentListCreateView(generics.ListCreateAPIView):
     
     def get_queryset(self):
         return Investment.objects.filter(user=self.request.user)
+    
+    def create(self, request, *args, **kwargs):
+        """Override create to add validation before saving."""
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        
+        # Get or create allocation
+        allocation, _ = InvestmentAllocation.objects.get_or_create(user=request.user)
+        
+        # Calculate total if this investment is added
+        new_total_invested = serializer.validated_data.get("total_invested", Decimal("0.00"))
+        existing_total = (
+            Investment.objects
+            .filter(user=request.user)
+            .aggregate(total=models.Sum("total_invested"))["total"] or Decimal("0.00")
+        )
+        
+        total_after_add = existing_total + new_total_invested
+        
+        # Validate: total_invested cannot exceed allocated amount
+        if total_after_add > allocation.total_allocated:
+            return Response(
+                {
+                    "error": (
+                        f"Cannot add investment. Total invested (₱{total_after_add:,.2f}) "
+                        f"would exceed allocated budget (₱{allocation.total_allocated:,.2f}). "
+                        f"Available to invest: ₱{allocation.total_allocated - existing_total:,.2f}. "
+                        f"Transfer funds from savings to increase investment budget."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        
+        self.perform_create(serializer)
+        headers = self.get_success_headers(serializer.data)
+        return Response(serializer.data, status=status.HTTP_201_CREATED, headers=headers)
     
     def perform_create(self, serializer):
         investment = serializer.save(user=self.request.user)
