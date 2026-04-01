@@ -39,6 +39,7 @@ from api.views import (
     ExpenseView,
     FinancialProfileView,
     IncomeView,
+    InvestmentAllocationView,
     InvestmentDetailView,
     InvestmentListCreateView,
     InvestView,
@@ -82,8 +83,9 @@ urlpatterns = [
     path("alerts/<int:pk>/read/",AlertMarkReadView.as_view(),        name="alert-mark-read"),
 
     # ── Investments ───────────────────────────────────────────────────────
-    path("investments/",         InvestmentListCreateView.as_view(), name="investment-list-create"),
-    path("investments/<int:pk>/",InvestmentDetailView.as_view(),     name="investment-detail"),
+    path("investments/",              InvestmentListCreateView.as_view(), name="investment-list-create"),
+    path("investments/<int:pk>/",     InvestmentDetailView.as_view(),     name="investment-detail"),
+    path("investments/allocation/",   InvestmentAllocationView.as_view(), name="investment-allocation"),
 
     # ── Month Management ──────────────────────────────────────────────────
     path("month/close/",         CloseMonthView.as_view(),           name="month-close"),

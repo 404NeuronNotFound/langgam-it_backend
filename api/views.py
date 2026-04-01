@@ -12,12 +12,13 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework_simplejwt.views import TokenObtainPairView
 
-from .models import Alert, Expense, FinancialProfile, MonthCycle, NetWorthSnapshot, Investment, MonthSummary
+from .models import Alert, Expense, FinancialProfile, MonthCycle, NetWorthSnapshot, Investment, MonthSummary, InvestmentAllocation
 from .serializers import (
     AlertSerializer,
     CustomTokenObtainPairSerializer,
     ExpenseSerializer,
     FinancialProfileSerializer,
+    InvestmentAllocationSerializer,
     InvestmentSerializer,
     MonthCycleSerializer,
     MonthSummarySerializer,
@@ -1143,3 +1144,79 @@ class InvestmentDetailView(generics.RetrieveUpdateDestroyAPIView):
  
     # Signal handles sync on save and delete — no extra code needed here
  
+
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 19. Investment Allocation  →  GET/PATCH /api/investments/allocation/
+# ──────────────────────────────────────────────────────────────────────
+
+class InvestmentAllocationView(APIView):
+    """
+    Get or update the user's investment allocation summary.
+    
+    GET  /api/investments/allocation/
+        Returns the total allocated, current value, and profit/loss
+    
+    PATCH /api/investments/allocation/
+        Update total_allocated (when user transfers savings → investments)
+        {
+            "total_allocated": "120000.00"
+        }
+    
+    The allocation tracks how investments_total is split across individual investments.
+    """
+    
+    permission_classes = [permissions.IsAuthenticated]
+    
+    def get(self, request):
+        allocation, created = InvestmentAllocation.objects.get_or_create(
+            user=request.user
+        )
+        
+        # Sync from current investments
+        allocation.sync_from_investments()
+        
+        return Response(
+            InvestmentAllocationSerializer(allocation).data,
+            status=status.HTTP_200_OK,
+        )
+    
+    def patch(self, request):
+        allocation, created = InvestmentAllocation.objects.get_or_create(
+            user=request.user
+        )
+        
+        # Update total_allocated if provided
+        if "total_allocated" in request.data:
+            try:
+                new_allocated = Decimal(str(request.data["total_allocated"]))
+                if new_allocated < Decimal("0.00"):
+                    return Response(
+                        {"error": "Total allocated cannot be negative."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                allocation.total_allocated = new_allocated
+                allocation.save(update_fields=["total_allocated", "updated_at"])
+            except (ValueError, TypeError):
+                return Response(
+                    {"error": "Invalid total_allocated value."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+        
+        # Sync from current investments
+        allocation.sync_from_investments()
+        
+        # Validate allocation
+        is_valid, message = allocation.validate_allocation()
+        
+        return Response(
+            {
+                "allocation": InvestmentAllocationSerializer(allocation).data,
+                "validation": {
+                    "is_valid": is_valid,
+                    "message": message,
+                }
+            },
+            status=status.HTTP_200_OK,
+        )
