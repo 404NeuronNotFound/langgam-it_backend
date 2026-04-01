@@ -1,6 +1,6 @@
 from django.contrib import admin
 
-from .models import Alert, AllocationLog, FinancialProfile, MonthCycle, NetWorthSnapshot, Expense, Investment, MonthSummary
+from .models import Alert, AllocationLog, FinancialProfile, MonthCycle, NetWorthSnapshot, Expense, Investment, MonthSummary, InvestmentAllocation
 
 
 class AllocationLogInline(admin.TabularInline):
@@ -26,5 +26,6 @@ admin.site.register(Alert)
 admin.site.register(Expense)
 admin.site.register(Investment)
 admin.site.register(MonthSummary)
+admin.site.register(InvestmentAllocation)
 
 

@@ -5,7 +5,7 @@ from django.contrib.auth.password_validation import validate_password
 from rest_framework import serializers
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 
-from .models import AllocationLog, FinancialProfile, MonthCycle, NetWorthSnapshot, Alert, Expense, Investment, MonthSummary
+from .models import AllocationLog, FinancialProfile, MonthCycle, NetWorthSnapshot, Alert, Expense, Investment, MonthSummary, InvestmentAllocation
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -343,3 +343,31 @@ class MonthSummarySerializer(serializers.ModelSerializer):
             "created_at",
         ]
         read_only_fields = fields  # All fields are read-only (generated from cycle data)
+
+
+class InvestmentAllocationSerializer(serializers.ModelSerializer):
+    """
+    Serializer for InvestmentAllocation model.
+    
+    Shows how the user's total investments are allocated across individual investments.
+    Includes computed profit/loss fields.
+    """
+    
+    profit_loss_percentage = serializers.SerializerMethodField()
+    
+    class Meta:
+        model = InvestmentAllocation
+        fields = [
+            "total_allocated",
+            "total_current_value",
+            "total_profit_loss",
+            "profit_loss_percentage",
+            "updated_at",
+        ]
+        read_only_fields = fields
+    
+    def get_profit_loss_percentage(self, obj) -> Decimal:
+        """Calculate profit/loss as percentage."""
+        if obj.total_allocated == Decimal("0.00"):
+            return Decimal("0.00")
+        return (obj.total_profit_loss / obj.total_allocated) * Decimal("100.00")

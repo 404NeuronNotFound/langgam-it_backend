@@ -593,3 +593,93 @@ class MonthSummary(models.Model):
         )
         
         return summary
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 9. Investment Allocation  (tracks how investments_total is allocated)
+# ──────────────────────────────────────────────────────────────────────
+
+class InvestmentAllocation(models.Model):
+    """
+    Tracks how the user's investments_total is allocated across individual investments.
+    
+    This ensures that the sum of all Investment.current_value equals
+    FinancialProfile.investments_total.
+    
+    When a user sets up investments in the setup wizard, they enter a total amount.
+    This total is then allocated across individual investment records.
+    
+    Example:
+        Setup: investments_total = ₱120,000
+        Allocations:
+            - BDO Stock: ₱40,000 (current_value: ₱45,000)
+            - Bitcoin: ₱50,000 (current_value: ₱55,000)
+            - Real Estate: ₱30,000 (current_value: ₱28,000)
+        Total: ₱120,000 ✓
+    """
+    
+    user = models.OneToOneField(
+        User,
+        on_delete=models.CASCADE,
+        related_name="investment_allocation",
+    )
+    
+    # Total amount allocated to investments (should match investments_total)
+    total_allocated = models.DecimalField(max_digits=14, decimal_places=2, default=Decimal("0.00"))
+    
+    # Computed: sum of all Investment.current_value
+    total_current_value = models.DecimalField(max_digits=14, decimal_places=2, default=Decimal("0.00"))
+    
+    # Computed: total_current_value - total_allocated
+    total_profit_loss = models.DecimalField(max_digits=14, decimal_places=2, default=Decimal("0.00"))
+    
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        verbose_name = "Investment Allocation"
+        verbose_name_plural = "Investment Allocations"
+    
+    def __str__(self) -> str:
+        return f"InvestmentAllocation({self.user.username}, ₱{self.total_allocated:,.2f})"
+    
+    def sync_from_investments(self) -> None:
+        """
+        Recalculate allocation totals from individual investments.
+        Should be called whenever an investment is created, updated, or deleted.
+        """
+        from django.db.models import Sum
+        
+        # Sum all current values
+        total_current = (
+            Investment.objects
+            .filter(user=self.user)
+            .aggregate(total=Sum("current_value"))["total"] or Decimal("0.00")
+        )
+        
+        # Calculate profit/loss
+        profit_loss = total_current - self.total_allocated
+        
+        self.total_current_value = total_current
+        self.total_profit_loss = profit_loss
+        self.save(update_fields=["total_current_value", "total_profit_loss", "updated_at"])
+    
+    def validate_allocation(self) -> tuple[bool, str]:
+        """
+        Validate that investments are properly allocated.
+        
+        Returns (is_valid, message)
+        """
+        total_invested = (
+            Investment.objects
+            .filter(user=self.user)
+            .aggregate(total=Sum("total_invested"))["total"] or Decimal("0.00")
+        )
+        
+        if total_invested != self.total_allocated:
+            return (
+                False,
+                f"Investment allocation mismatch: "
+                f"allocated ₱{self.total_allocated:,.2f} but invested ₱{total_invested:,.2f}"
+            )
+        
+        return True, "Investment allocation is valid"
