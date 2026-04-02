@@ -838,7 +838,9 @@ class InvestmentListCreateView(generics.ListCreateAPIView):
         total_after_add = existing_total + new_total_invested
         
         # Validate: total_invested cannot exceed allocated amount
-        if total_after_add > allocation.total_allocated:
+        # Only validate if total_allocated is set (> 0)
+        # If total_allocated is 0, user hasn't set up investments yet, so allow freely
+        if allocation.total_allocated > Decimal("0.00") and total_after_add > allocation.total_allocated:
             return Response(
                 {
                     "error": (
