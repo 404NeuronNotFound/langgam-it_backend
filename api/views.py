@@ -257,7 +257,8 @@ class InvestView(APIView):
     POST  /api/invest/
         { "amount": "5000.00" }
 
-    Requires an active MonthCycle (call POST /api/income/ first).
+    This transfers money from savings to investments_total and updates
+    the investment allocation budget. Does not require an active cycle.
 
     Success 200:
         { "profile": { ... } }
@@ -274,19 +275,27 @@ class InvestView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        profile, _ = FinancialProfile.objects.get_or_create(user=request.user)
+
+        # Get or create an active cycle for logging purposes
+        # If no active cycle exists, create a temporary one for this transaction
         cycle = (
             MonthCycle.objects
             .filter(user=request.user, status=MonthCycle.STATUS_ACTIVE)
             .order_by("-year", "-month")
             .first()
         )
+        
         if cycle is None:
-            return Response(
-                {"error": "No active month cycle. Call POST /api/income/ first."},
-                status=status.HTTP_400_BAD_REQUEST,
+            # Create a temporary cycle for logging the transfer
+            from django.utils import timezone
+            now = timezone.now()
+            cycle, _ = MonthCycle.objects.get_or_create(
+                user=request.user,
+                year=now.year,
+                month=now.month,
+                defaults={"status": MonthCycle.STATUS_ACTIVE}
             )
-
-        profile, _ = FinancialProfile.objects.get_or_create(user=request.user)
 
         try:
             profile = run_invest(profile, cycle, amount)
@@ -310,7 +319,8 @@ class DivestView(APIView):
     POST  /api/divest/
         { "amount": "5000.00" }
 
-    Requires an active MonthCycle (call POST /api/income/ first).
+    This transfers money from investments back to savings and updates
+    the investment allocation budget. Does not require an active cycle.
 
     Success 200:
         { "profile": { ... } }
@@ -327,19 +337,27 @@ class DivestView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        profile, _ = FinancialProfile.objects.get_or_create(user=request.user)
+
+        # Get or create an active cycle for logging purposes
+        # If no active cycle exists, create a temporary one for this transaction
         cycle = (
             MonthCycle.objects
             .filter(user=request.user, status=MonthCycle.STATUS_ACTIVE)
             .order_by("-year", "-month")
             .first()
         )
+        
         if cycle is None:
-            return Response(
-                {"error": "No active month cycle. Call POST /api/income/ first."},
-                status=status.HTTP_400_BAD_REQUEST,
+            # Create a temporary cycle for logging the transfer
+            from django.utils import timezone
+            now = timezone.now()
+            cycle, _ = MonthCycle.objects.get_or_create(
+                user=request.user,
+                year=now.year,
+                month=now.month,
+                defaults={"status": MonthCycle.STATUS_ACTIVE}
             )
-
-        profile, _ = FinancialProfile.objects.get_or_create(user=request.user)
 
         try:
             profile = run_divest(profile, cycle, amount)
@@ -822,33 +840,12 @@ class InvestmentListCreateView(generics.ListCreateAPIView):
     def create(self, request, *args, **kwargs):
         """Override create to add validation before saving."""
         serializer = self.get_serializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
         
-        # Get or create allocation
-        allocation, _ = InvestmentAllocation.objects.get_or_create(user=request.user)
-        
-        # Calculate total if this investment is added
-        new_total_invested = serializer.validated_data.get("total_invested", Decimal("0.00"))
-        existing_total = (
-            Investment.objects
-            .filter(user=request.user)
-            .aggregate(total=models.Sum("total_invested"))["total"] or Decimal("0.00")
-        )
-        
-        total_after_add = existing_total + new_total_invested
-        
-        # Validate: total_invested cannot exceed allocated amount
-        # Only validate if total_allocated is set (> 0)
-        # If total_allocated is 0, user hasn't set up investments yet, so allow freely
-        if allocation.total_allocated > Decimal("0.00") and total_after_add > allocation.total_allocated:
+        if not serializer.is_valid():
             return Response(
                 {
-                    "error": (
-                        f"Cannot add investment. Total invested (₱{total_after_add:,.2f}) "
-                        f"would exceed allocated budget (₱{allocation.total_allocated:,.2f}). "
-                        f"Available to invest: ₱{allocation.total_allocated - existing_total:,.2f}. "
-                        f"Transfer funds from savings to increase investment budget."
-                    )
+                    "error": "Validation failed",
+                    "details": serializer.errors
                 },
                 status=status.HTTP_400_BAD_REQUEST,
             )

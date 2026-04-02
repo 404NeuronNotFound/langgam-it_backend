@@ -278,6 +278,12 @@ class InvestmentSerializer(serializers.ModelSerializer):
     """
     Serializer for Investment model with computed profit/loss fields.
     
+    Required fields for creation:
+        - name: Investment name (e.g., "BDO Stock", "Bitcoin")
+        - type: Investment type (stocks, crypto, bonds, mutual_funds, real_estate, other)
+        - total_invested: Amount invested (cost basis)
+        - current_value: Current market value
+    
     Read-only computed fields:
         - profit_loss: current_value - total_invested
         - profit_loss_percentage: (profit_loss / total_invested) * 100
@@ -309,6 +315,65 @@ class InvestmentSerializer(serializers.ModelSerializer):
             "updated_at",
         ]
         read_only_fields = ["id", "profit_loss", "profit_loss_percentage", "created_at", "updated_at"]
+    
+    def validate_name(self, value):
+        """Validate that name is not empty."""
+        if not value or not value.strip():
+            raise serializers.ValidationError("Investment name cannot be empty.")
+        return value.strip()
+    
+    def validate_type(self, value):
+        """Validate that type is one of the allowed choices."""
+        valid_types = [choice[0] for choice in Investment.TYPE_CHOICES]
+        if value not in valid_types:
+            raise serializers.ValidationError(
+                f"Invalid investment type. Must be one of: {', '.join(valid_types)}"
+            )
+        return value
+    
+    def validate_total_invested(self, value):
+        """
+        Validate that total_invested doesn't exceed available investment pool.
+        
+        Available pool = investments_total - sum of all existing investments' total_invested
+        """
+        if value < Decimal("0.00"):
+            raise serializers.ValidationError("Total invested must be non-negative.")
+        
+        request = self.context.get('request')
+        if not request or not request.user.is_authenticated:
+            return value
+        
+        try:
+            profile = request.user.financial_profile
+        except FinancialProfile.DoesNotExist:
+            return value
+        
+        # Calculate already-invested amount
+        from django.db.models import Sum
+        already_invested = (
+            Investment.objects
+            .filter(user=request.user)
+            .aggregate(total=Sum('total_invested'))['total'] or Decimal("0.00")
+        )
+        
+        # Available = transferred funds - already invested
+        available = profile.investments_total - already_invested
+        
+        if value > available:
+            raise serializers.ValidationError(
+                f"Investment amount exceeds available investment budget. "
+                f"Available: ₱{float(available):,.2f}, Requested: ₱{float(value):,.2f}. "
+                f"Please transfer more funds from savings to increase your investment budget."
+            )
+        
+        return value
+    
+    def validate_current_value(self, value):
+        """Validate that current_value is positive."""
+        if value < Decimal("0.00"):
+            raise serializers.ValidationError("Current value must be non-negative.")
+        return value
 
 
 class MonthSummarySerializer(serializers.ModelSerializer):
