@@ -43,7 +43,7 @@ from decimal import Decimal
 import calendar
 from datetime import date
 
-from .models import Alert, AllocationLog, Expense, FinancialProfile, MonthCycle, NetWorthSnapshot
+from .models import Alert, AllocationLog, Expense, FinancialProfile, MonthCycle, NetWorthSnapshot, InvestmentAllocation
 
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -206,7 +206,8 @@ def run_invest(
     Step 8 — Move `amount` from savings → investments_total.
 
     Raises ValueError if the amount is non-positive or exceeds available savings.
-    Logs the transfer and captures a NetWorthSnapshot.
+    Logs the transfer, updates InvestmentAllocation.total_allocated, and captures 
+    a NetWorthSnapshot.
     """
     if amount <= Decimal("0.00"):
         raise ValueError("Investment amount must be positive.")
@@ -222,6 +223,12 @@ def run_invest(
     profile.save()
 
     _log(cycle, "savings", "investments_total", amount)
+    
+    # Update InvestmentAllocation.total_allocated to reflect the new investment budget
+    allocation, _ = InvestmentAllocation.objects.get_or_create(user=profile.user)
+    allocation.total_allocated += amount
+    allocation.save(update_fields=["total_allocated", "updated_at"])
+    
     NetWorthSnapshot.capture(profile)
 
     return profile
@@ -236,7 +243,8 @@ def run_divest(
     Move `amount` from investments_total → savings (reverse of invest).
 
     Raises ValueError if the amount is non-positive or exceeds available investments.
-    Logs the transfer and captures a NetWorthSnapshot.
+    Logs the transfer, updates InvestmentAllocation.total_allocated, and captures 
+    a NetWorthSnapshot.
     
     Note: This moves money from the investments_total pool back to savings.
     Individual Investment records should be updated separately to reflect
@@ -256,6 +264,12 @@ def run_divest(
     profile.save()
 
     _log(cycle, "investments_total", "savings", amount)
+    
+    # Update InvestmentAllocation.total_allocated to reflect the reduced investment budget
+    allocation, _ = InvestmentAllocation.objects.get_or_create(user=profile.user)
+    allocation.total_allocated = max(Decimal("0.00"), allocation.total_allocated - amount)
+    allocation.save(update_fields=["total_allocated", "updated_at"])
+    
     NetWorthSnapshot.capture(profile)
 
     return profile
