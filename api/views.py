@@ -127,8 +127,18 @@ class FinancialProfileView(APIView):
         profile    = self._get_or_create_profile(request.user)
         serializer = FinancialProfileSerializer(profile, data=request.data, partial=True)
         serializer.is_valid(raise_exception=True)
+        
+        # Store old values to detect if anything actually changed
+        old_net_worth = profile.net_worth
+        
         serializer.save()
-        NetWorthSnapshot.capture(profile)
+        
+        # Only capture snapshot if net worth actually changed
+        # This prevents duplicate snapshots when frontend sends multiple PATCH requests
+        new_net_worth = profile.net_worth
+        if new_net_worth != old_net_worth:
+            NetWorthSnapshot.capture(profile)
+        
         return Response(serializer.data, status=status.HTTP_200_OK)
 
 
