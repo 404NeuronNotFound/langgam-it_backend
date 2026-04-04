@@ -1069,7 +1069,7 @@ class ReportsView(APIView):
         else:  # 'all'
             start_date = None
         
-        # Get MonthSummary records within date range
+        # Try to get data from MonthSummary first (if months have been closed)
         summaries_qs = MonthSummary.objects.filter(user=user)
         
         if start_date:
@@ -1077,7 +1077,11 @@ class ReportsView(APIView):
         
         summaries = list(summaries_qs.order_by('cycle__year', 'cycle__month'))
         
-        # Calculate totals
+        # If no MonthSummary records, build from MonthCycle and Expense data
+        if not summaries:
+            return self._get_reports_from_cycles(user, start_date)
+        
+        # Calculate totals from MonthSummary
         total_income = sum(s.total_income for s in summaries) if summaries else Decimal("0.00")
         total_expenses = sum(s.total_expenses for s in summaries) if summaries else Decimal("0.00")
         total_savings = total_income - total_expenses
@@ -1113,6 +1117,110 @@ class ReportsView(APIView):
                 "month": month_str,
                 "net_worth": float(summary.net_worth_end),
             })
+        
+        return Response(
+            {
+                "summary": {
+                    "total_income": float(total_income),
+                    "total_expenses": float(total_expenses),
+                    "total_savings": float(total_savings),
+                    "savings_rate": float(savings_rate),
+                },
+                "income_vs_expenses": income_vs_expenses,
+                "savings_trend": savings_trend,
+                "net_worth_history": net_worth_history,
+            },
+            status=status.HTTP_200_OK,
+        )
+    
+    def _get_reports_from_cycles(self, user, start_date):
+        """
+        Build reports from MonthCycle and Expense data when MonthSummary is not available.
+        This allows reports to work even before months are closed.
+        """
+        from django.db.models import Sum, Q
+        
+        # Get all cycles for this user
+        cycles_qs = MonthCycle.objects.filter(user=user)
+        
+        if start_date:
+            cycles_qs = cycles_qs.filter(created_at__date__gte=start_date)
+        
+        cycles = list(cycles_qs.order_by('year', 'month'))
+        
+        if not cycles:
+            # No data at all
+            return Response(
+                {
+                    "summary": {
+                        "total_income": 0,
+                        "total_expenses": 0,
+                        "total_savings": 0,
+                        "savings_rate": 0,
+                    },
+                    "income_vs_expenses": [],
+                    "savings_trend": [],
+                    "net_worth_history": [],
+                },
+                status=status.HTTP_200_OK,
+            )
+        
+        # Build data by cycle
+        income_vs_expenses = []
+        savings_trend = []
+        net_worth_history = []
+        
+        total_income = Decimal("0.00")
+        total_expenses = Decimal("0.00")
+        cumulative_savings = Decimal("0.00")
+        
+        for cycle in cycles:
+            month_str = f"{calendar.month_abbr[cycle.month]} {cycle.year}"
+            
+            # Get expenses for this cycle
+            cycle_expenses = (
+                Expense.objects
+                .filter(cycle=cycle)
+                .aggregate(total=Sum('amount'))['total'] or Decimal("0.00")
+            )
+            
+            cycle_income = cycle.income
+            cycle_savings = cycle_income - cycle_expenses
+            
+            total_income += cycle_income
+            total_expenses += cycle_expenses
+            cumulative_savings += cycle_savings
+            
+            # Income vs Expenses
+            income_vs_expenses.append({
+                "month": month_str,
+                "income": float(cycle_income),
+                "expenses": float(cycle_expenses),
+            })
+            
+            # Savings Trend
+            savings_trend.append({
+                "month": month_str,
+                "savings": float(cycle_savings),
+                "cumulative": float(cumulative_savings),
+            })
+            
+            # Net Worth History - get latest snapshot for this cycle
+            latest_snapshot = (
+                NetWorthSnapshot.objects
+                .filter(user=user, captured_at__gte=cycle.created_at)
+                .order_by('-captured_at')
+                .first()
+            )
+            
+            net_worth_value = latest_snapshot.net_worth if latest_snapshot else Decimal("0.00")
+            net_worth_history.append({
+                "month": month_str,
+                "net_worth": float(net_worth_value),
+            })
+        
+        total_savings = total_income - total_expenses
+        savings_rate = (total_savings / total_income * 100) if total_income > Decimal("0.00") else Decimal("0.00")
         
         return Response(
             {
