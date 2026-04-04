@@ -495,19 +495,6 @@ class ExpenseView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def post(self, request):
-        # Resolve active cycle
-        cycle = (
-            MonthCycle.objects
-            .filter(user=request.user, status=MonthCycle.STATUS_ACTIVE)
-            .order_by("-year", "-month")
-            .first()
-        )
-        if cycle is None:
-            return Response(
-                {"error": "No active month cycle. Submit income via POST /api/income/ first."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
         profile, _ = FinancialProfile.objects.get_or_create(user=request.user)
 
         # Validate incoming data
@@ -528,6 +515,33 @@ class ExpenseView(APIView):
                     )
                 },
                 status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # Resolve active cycle
+        # If no active cycle exists, create one for tracking expenses
+        cycle = (
+            MonthCycle.objects
+            .filter(user=request.user, status=MonthCycle.STATUS_ACTIVE)
+            .order_by("-year", "-month")
+            .first()
+        )
+        
+        if cycle is None:
+            # Create a temporary cycle for tracking expenses from cash_on_hand
+            # This allows users to track expenses before their first income
+            from django.utils import timezone
+            now = timezone.now()
+            cycle, _ = MonthCycle.objects.get_or_create(
+                user=request.user,
+                year=now.year,
+                month=now.month,
+                defaults={
+                    "status": MonthCycle.STATUS_ACTIVE,
+                    "income": Decimal("0.00"),
+                    "expenses_budget": Decimal("0.00"),
+                    "wants_budget": Decimal("0.00"),
+                    "remaining_budget": Decimal("0.00"),
+                }
             )
 
         # Resolve expense date (default to today)
