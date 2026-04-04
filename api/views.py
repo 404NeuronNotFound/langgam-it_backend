@@ -1017,96 +1017,114 @@ class CloseMonthView(APIView):
 
 class ReportsView(APIView):
     """
-    Monthly summary history and charts data.
+    Financial reports with time range filtering and monthly breakdowns.
     
     GET  /api/reports/
     
     Query params:
-        - months: number of months to include (default: 12)
-        - year: filter by specific year (optional)
+        - time_range: '1m' (month), '6m' (6 months), '1y' (1 year), 'all' (all time)
+                      defaults to '6m'
     
     Success 200:
         {
-            "summaries": [ ... ],
-            "charts": {
-                "income_trend": [ ... ],
-                "expense_trend": [ ... ],
-                "savings_trend": [ ... ],
-                "net_worth_trend": [ ... ]
+            "summary": {
+                "total_income": "50000.00",
+                "total_expenses": "15000.00",
+                "total_savings": "35000.00",
+                "savings_rate": "70.0"
             },
-            "totals": {
-                "total_income": "120000.00",
-                "total_expenses": "80000.00",
-                "total_saved": "40000.00"
-            }
+            "income_vs_expenses": [
+                {"month": "Apr 2026", "income": 50000, "expenses": 15000},
+                ...
+            ],
+            "savings_trend": [
+                {"month": "Apr 2026", "savings": 35000, "cumulative": 35000},
+                ...
+            ],
+            "net_worth_history": [
+                {"month": "Apr 2026", "net_worth": 500000},
+                ...
+            ]
         }
     """
     
     permission_classes = [permissions.IsAuthenticated]
     
     def get(self, request):
-        # Get query parameters
-        months = int(request.query_params.get("months", 12))
-        year = request.query_params.get("year")
+        from datetime import datetime, timedelta
+        from django.db.models import Sum, Q
         
-        # Build queryset
-        summaries_qs = MonthSummary.objects.filter(user=request.user)
+        user = request.user
+        time_range = request.query_params.get('time_range', '6m')
         
-        if year:
-            summaries_qs = summaries_qs.filter(cycle__year=int(year))
+        # Calculate date range
+        today = datetime.now().date()
+        if time_range == '1m':
+            # Current month only
+            start_date = today.replace(day=1)
+        elif time_range == '6m':
+            start_date = today - timedelta(days=180)
+        elif time_range == '1y':
+            start_date = today - timedelta(days=365)
+        else:  # 'all'
+            start_date = None
         
-        summaries_qs = summaries_qs.order_by("-cycle__year", "-cycle__month")[:months]
-        summaries = list(summaries_qs)
+        # Get MonthSummary records within date range
+        summaries_qs = MonthSummary.objects.filter(user=user)
         
-        # Serialize summaries
-        summaries_data = MonthSummarySerializer(summaries, many=True).data
+        if start_date:
+            summaries_qs = summaries_qs.filter(cycle__created_at__date__gte=start_date)
         
-        # Prepare chart data (reverse order for chronological display)
-        summaries_reversed = list(reversed(summaries))
-        
-        charts = {
-            "income_trend": [
-                {
-                    "month": f"{s.cycle.year}-{s.cycle.month:02d}",
-                    "value": float(s.total_income)
-                }
-                for s in summaries_reversed
-            ],
-            "expense_trend": [
-                {
-                    "month": f"{s.cycle.year}-{s.cycle.month:02d}",
-                    "value": float(s.total_expenses)
-                }
-                for s in summaries_reversed
-            ],
-            "savings_trend": [
-                {
-                    "month": f"{s.cycle.year}-{s.cycle.month:02d}",
-                    "value": float(s.total_saved)
-                }
-                for s in summaries_reversed
-            ],
-            "net_worth_trend": [
-                {
-                    "month": f"{s.cycle.year}-{s.cycle.month:02d}",
-                    "value": float(s.net_worth_end)
-                }
-                for s in summaries_reversed
-            ],
-        }
+        summaries = list(summaries_qs.order_by('cycle__year', 'cycle__month'))
         
         # Calculate totals
-        totals = {
-            "total_income": sum(s.total_income for s in summaries),
-            "total_expenses": sum(s.total_expenses for s in summaries),
-            "total_saved": sum(s.total_saved for s in summaries),
-        }
+        total_income = sum(s.total_income for s in summaries) if summaries else Decimal("0.00")
+        total_expenses = sum(s.total_expenses for s in summaries) if summaries else Decimal("0.00")
+        total_savings = total_income - total_expenses
+        savings_rate = (total_savings / total_income * 100) if total_income > Decimal("0.00") else Decimal("0.00")
+        
+        # Build monthly breakdown
+        income_vs_expenses = []
+        savings_trend = []
+        net_worth_history = []
+        cumulative_savings = Decimal("0.00")
+        
+        for summary in summaries:
+            month_str = f"{calendar.month_abbr[summary.cycle.month]} {summary.cycle.year}"
+            
+            # Income vs Expenses
+            income_vs_expenses.append({
+                "month": month_str,
+                "income": float(summary.total_income),
+                "expenses": float(summary.total_expenses),
+            })
+            
+            # Savings Trend
+            monthly_savings = summary.total_income - summary.total_expenses
+            cumulative_savings += monthly_savings
+            savings_trend.append({
+                "month": month_str,
+                "savings": float(monthly_savings),
+                "cumulative": float(cumulative_savings),
+            })
+            
+            # Net Worth History
+            net_worth_history.append({
+                "month": month_str,
+                "net_worth": float(summary.net_worth_end),
+            })
         
         return Response(
             {
-                "summaries": summaries_data,
-                "charts": charts,
-                "totals": totals,
+                "summary": {
+                    "total_income": float(total_income),
+                    "total_expenses": float(total_expenses),
+                    "total_savings": float(total_savings),
+                    "savings_rate": float(savings_rate),
+                },
+                "income_vs_expenses": income_vs_expenses,
+                "savings_trend": savings_trend,
+                "net_worth_history": net_worth_history,
             },
             status=status.HTTP_200_OK,
         )
