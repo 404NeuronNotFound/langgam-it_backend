@@ -30,6 +30,7 @@ from rest_framework_simplejwt.views import TokenRefreshView
 from api.views import (
     AlertListView,
     AlertMarkReadView,
+    ChangePasswordView,
     CloseMonthView,
     CurrentMonthCycleView,
     CustomTokenObtainPairView,
@@ -49,6 +50,7 @@ from api.views import (
     RegisterView,
     ReportsView,
     ResetExpensesView,
+    UserProfileView,
 )
 
 urlpatterns = [
@@ -57,6 +59,8 @@ urlpatterns = [
     path("auth/token/",         CustomTokenObtainPairView.as_view(), name="auth-token-obtain"),
     path("auth/token/refresh/", TokenRefreshView.as_view(),          name="auth-token-refresh"),
     path("auth/me/",            MeView.as_view(),                    name="auth-me"),
+    path("auth/profile/",       UserProfileView.as_view(),           name="auth-profile"),
+    path("auth/change-password/", ChangePasswordView.as_view(),      name="auth-change-password"),
 
     # ── Finance ───────────────────────────────────────────────────────────
     path("finance/profile/",    FinancialProfileView.as_view(),      name="finance-profile"),

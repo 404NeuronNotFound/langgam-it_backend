@@ -15,6 +15,7 @@ from rest_framework_simplejwt.views import TokenObtainPairView
 from .models import Alert, Expense, FinancialProfile, MonthCycle, NetWorthSnapshot, Investment, MonthSummary, InvestmentAllocation
 from .serializers import (
     AlertSerializer,
+    ChangePasswordSerializer,
     CustomTokenObtainPairSerializer,
     ExpenseSerializer,
     FinancialProfileSerializer,
@@ -24,6 +25,7 @@ from .serializers import (
     MonthSummarySerializer,
     NetWorthSnapshotSerializer,
     RegisterSerializer,
+    UserProfileSerializer,
     UserSerializer,
 )
 from .services import run_allocation_engine, run_expense, run_invest, run_divest
@@ -1312,3 +1314,90 @@ class InvestmentAllocationView(APIView):
             },
             status=status.HTTP_200_OK,
         )
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 20. User Profile  →  PATCH /api/auth/profile/
+# ──────────────────────────────────────────────────────────────────────
+
+class UserProfileView(APIView):
+    """
+    Update user profile information (first_name, last_name, email).
+    
+    PATCH /api/auth/profile/
+    
+    Request body:
+        {
+            "first_name": "John",
+            "last_name": "Doe",
+            "email": "john@example.com"
+        }
+    
+    Success 200:
+        {
+            "id": 1,
+            "username": "johndoe",
+            "first_name": "John",
+            "last_name": "Doe",
+            "email": "john@example.com",
+            "date_joined": "2026-01-15T10:30:00Z"
+        }
+    """
+    
+    permission_classes = [permissions.IsAuthenticated]
+    
+    def patch(self, request):
+        """Update user profile."""
+        user = request.user
+        serializer = UserProfileSerializer(user, data=request.data, partial=True)
+        
+        if serializer.is_valid():
+            serializer.save()
+            return Response(serializer.data, status=status.HTTP_200_OK)
+        
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 21. Change Password  →  POST /api/auth/change-password/
+# ──────────────────────────────────────────────────────────────────────
+
+class ChangePasswordView(APIView):
+    """
+    Change user password with old password verification.
+    
+    POST /api/auth/change-password/
+    
+    Request body:
+        {
+            "old_password": "currentPassword123",
+            "new_password": "newPassword456",
+            "confirm_password": "newPassword456"
+        }
+    
+    Success 200:
+        {
+            "detail": "Password changed successfully"
+        }
+    """
+    
+    permission_classes = [permissions.IsAuthenticated]
+    
+    def post(self, request):
+        """Change password."""
+        serializer = ChangePasswordSerializer(
+            data=request.data,
+            context={'request': request}
+        )
+        
+        if serializer.is_valid():
+            user = request.user
+            user.set_password(serializer.validated_data['new_password'])
+            user.save()
+            
+            return Response(
+                {'detail': 'Password changed successfully'},
+                status=status.HTTP_200_OK
+            )
+        
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)

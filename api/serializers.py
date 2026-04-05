@@ -438,3 +438,72 @@ class InvestmentAllocationSerializer(serializers.ModelSerializer):
         if obj.total_allocated == Decimal("0.00"):
             return Decimal("0.00")
         return (obj.total_profit_loss / obj.total_allocated) * Decimal("100.00")
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 10. User Profile — for updating profile information
+# ──────────────────────────────────────────────────────────────────────
+
+class UserProfileSerializer(serializers.ModelSerializer):
+    """
+    Serializer for updating user profile information.
+    
+    Allows users to update:
+        - first_name
+        - last_name
+        - email
+    
+    Validates email uniqueness (excluding current user).
+    """
+    
+    class Meta:
+        model = User
+        fields = ['id', 'username', 'first_name', 'last_name', 'email', 'date_joined']
+        read_only_fields = ['id', 'username', 'date_joined']
+    
+    def validate_email(self, value):
+        """Ensure email is unique (excluding current user)."""
+        user = self.instance
+        if User.objects.filter(email__iexact=value).exclude(pk=user.pk).exists():
+            raise serializers.ValidationError("This email is already in use.")
+        return value.lower()
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 11. Change Password — for password changes
+# ──────────────────────────────────────────────────────────────────────
+
+class ChangePasswordSerializer(serializers.Serializer):
+    """
+    Serializer for changing user password.
+    
+    Validates:
+        - old_password: must be correct
+        - new_password: must meet Django password requirements
+        - confirm_password: must match new_password
+    """
+    
+    old_password = serializers.CharField(write_only=True, required=True)
+    new_password = serializers.CharField(write_only=True, required=True)
+    confirm_password = serializers.CharField(write_only=True, required=True)
+    
+    def validate_old_password(self, value):
+        """Verify old password is correct."""
+        user = self.context['request'].user
+        if not user.check_password(value):
+            raise serializers.ValidationError("Incorrect password.")
+        return value
+    
+    def validate_new_password(self, value):
+        """Validate new password strength."""
+        try:
+            validate_password(value)
+        except serializers.ValidationError as e:
+            raise serializers.ValidationError(str(e))
+        return value
+    
+    def validate(self, data):
+        """Ensure new passwords match."""
+        if data['new_password'] != data['confirm_password']:
+            raise serializers.ValidationError({'confirm_password': 'Passwords do not match.'})
+        return data
