@@ -57,7 +57,7 @@ if not DEBUG:
 CORS_ALLOWED_ORIGINS = [
     "http://localhost:5173",    # Vite dev
     "http://localhost:3000",    # CRA / Next.js dev
-    # "https://your-frontend.onrender.com",  # ← add after frontend deploy
+    "https://langgam-it-by-keybeen.vercel.app/",  # ← add after frontend deploy
 ]
 
 # ── JWT (same as before, explicit here for reference) ─────────────────────────
