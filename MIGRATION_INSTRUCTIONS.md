@@ -1,5 +1,21 @@
 # Migration Instructions
 
+## ⚠️ CRITICAL: Production Database Setup
+
+**Before deploying to production, ensure:**
+
+1. Your production environment has a **PostgreSQL database** linked (not SQLite)
+2. Run migrations on the production database to create all required tables including `django_session`
+3. The `django_session` table is essential for user authentication to persist across requests
+
+On Render.com:
+```bash
+# SSH into your service and run:
+python manage.py migrate
+```
+
+---
+
 ## Required Action
 
 The database migrations have been created but not yet applied. You need to run the following command in your terminal with the virtual environment activated:
@@ -16,6 +32,7 @@ This will create the following new tables:
 - `api_investment` - Individual investment records
 - `api_monthsummary` - End-of-month financial summaries
 - `api_investmentallocation` - Investment allocation tracking
+- `django_session` - Session storage (required for production authentication)
 
 ## What Changed
 

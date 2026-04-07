@@ -60,6 +60,14 @@ CORS_ALLOWED_ORIGINS = [
     "https://langgam-it-by-keybeen.vercel.app/",  # ← add after frontend deploy
 ]
 
+# ── Sessions ──────────────────────────────────────────────────────────────────
+# Store sessions in the database (PostgreSQL in production)
+SESSION_ENGINE = "django.contrib.sessions.backends.db"
+SESSION_COOKIE_AGE = 86400  # 24 hours
+SESSION_COOKIE_SECURE = not DEBUG  # HTTPS only in production
+SESSION_COOKIE_HTTPONLY = True
+SESSION_COOKIE_SAMESITE = "Lax"
+
 # ── JWT (same as before, explicit here for reference) ─────────────────────────
 SIMPLE_JWT = {
     "ACCESS_TOKEN_LIFETIME":    timedelta(minutes=30),
