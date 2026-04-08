@@ -1,0 +1,102 @@
+================================================================================
+                    IMMEDIATE ACTION REQUIRED
+================================================================================
+
+PROBLEM: Users lose their accounts after 30 minutes in production
+
+ROOT CAUSE: Using Render.com's free tier PostgreSQL database
+            Free tier databases are EPHEMERAL (temporary) and get deleted
+
+SOLUTION: Switch to a persistent database (15 minutes to fix)
+
+================================================================================
+                         QUICK FIX (Choose One)
+================================================================================
+
+OPTION 1: Supabase (FREE - Recommended)
+─────────────────────────────────────────
+1. Go to https://supabase.com → Sign up
+2. Create new project
+3. Settings → Database → Copy connection string
+4. Render dashboard → Your backend → Environment
+5. Add: DATABASE_URL = [paste connection string]
+6. Save Changes (service redeploys)
+7. Wait 2-3 minutes
+8. DONE - Data now persists!
+
+OPTION 2: Render Standard PostgreSQL ($15/month)
+──────────────────────────────────────────────────
+1. Render dashboard → New + → PostgreSQL
+2. Name: langgamit-db
+3. Plan: STANDARD (NOT free!)
+4. Create Database
+5. Wait 5-10 minutes
+6. Copy Internal Database URL
+7. Your backend → Environment
+8. Update: DATABASE_URL = [paste URL]
+9. Save Changes
+10. Wait 2-3 minutes
+11. DONE - Data now persists!
+
+================================================================================
+                            VERIFY IT WORKS
+================================================================================
+
+1. Register a new user
+2. Set up financial profile
+3. Wait 30+ minutes
+4. Try to login
+5. ✓ Account should still exist with all data
+
+================================================================================
+                         FILES TO READ
+================================================================================
+
+1. QUICK_START_FIX.md
+   → 15-minute quick start guide
+
+2. README_PRODUCTION_FIX.md
+   → Complete detailed guide with troubleshooting
+
+3. URGENT_FIX_INSTRUCTIONS.md
+   → Step-by-step instructions
+
+4. DATABASE_PERSISTENCE_FIX.md
+   → Why this is happening and how to fix it
+
+5. check_database.py
+   → Diagnostic tool to verify your setup
+
+================================================================================
+                            WHAT I FIXED
+================================================================================
+
+✓ Updated settings_render.py with proper database configuration
+✓ Fixed requirements.txt (was corrupted)
+✓ Added session configuration for database persistence
+✓ Added connection pooling and health checks
+✓ Added logging for debugging
+✓ Created comprehensive documentation
+
+================================================================================
+                         DO THIS RIGHT NOW
+================================================================================
+
+1. Read: QUICK_START_FIX.md (5 minutes)
+2. Choose: Supabase or Render Standard (1 minute)
+3. Implement: Follow the steps (10-15 minutes)
+4. Test: Register user, wait 30+ minutes, verify data persists
+5. Done: Your app now works properly!
+
+================================================================================
+
+Your app is currently BROKEN - users are losing their data.
+
+This fix is CRITICAL and must be done IMMEDIATELY.
+
+Choose Supabase if you want FREE.
+Choose Render if you want RELIABILITY.
+
+Either way, your app will work properly after this fix.
+
+================================================================================

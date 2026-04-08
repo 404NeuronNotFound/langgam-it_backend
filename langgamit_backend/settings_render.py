@@ -26,6 +26,9 @@ if RENDER_HOST:
     ALLOWED_HOSTS.append(RENDER_HOST)
 
 # ── Database ───────────────────────────────────────────────────────────────────
+# CRITICAL: Use persistent PostgreSQL database, NOT free tier
+# Free tier databases on Render are ephemeral and get deleted periodically
+# 
 # Render injects DATABASE_URL for the linked PostgreSQL service.
 # Locally this variable is absent so Django uses the default SQLite config
 # you already have above this block.
@@ -37,7 +40,20 @@ if DATABASE_URL:
             default=DATABASE_URL,
             conn_max_age=600,
             conn_health_checks=True,
+            # Ensure connections are properly recycled
+            options={
+                'connect_timeout': 10,
+                'options': '-c statement_timeout=30000'
+            }
         )
+    }
+else:
+    # Fallback to SQLite for local development
+    DATABASES = {
+        'default': {
+            'ENGINE': 'django.db.backends.sqlite3',
+            'NAME': os.path.join(BASE_DIR, 'db.sqlite3'),
+        }
     }
 
 # ── Static files (WhiteNoise) ──────────────────────────────────────────────────
@@ -59,6 +75,29 @@ CORS_ALLOWED_ORIGINS = [
     "http://localhost:3000",    # CRA / Next.js dev
     "https://langgam-it-by-keybeen.vercel.app/",  # ← add after frontend deploy
 ]
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+# Log database connection issues for debugging
+LOGGING = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'handlers': {
+        'console': {
+            'class': 'logging.StreamHandler',
+        },
+    },
+    'root': {
+        'handlers': ['console'],
+        'level': 'INFO',
+    },
+    'loggers': {
+        'django.db.backends': {
+            'handlers': ['console'],
+            'level': 'DEBUG' if DEBUG else 'INFO',
+            'propagate': False,
+        },
+    },
+}
 
 # ── Sessions ──────────────────────────────────────────────────────────────────
 # Store sessions in the database (PostgreSQL in production)
