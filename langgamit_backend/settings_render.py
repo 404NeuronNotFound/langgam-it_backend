@@ -73,8 +73,11 @@ if not DEBUG:
 CORS_ALLOWED_ORIGINS = [
     "http://localhost:5173",    # Vite dev
     "http://localhost:3000",    # CRA / Next.js dev
-    "https://langgam-it-by-keybeen.vercel.app/",  # ← add after frontend deploy
+    "https://langgam-it-by-keybeen.vercel.app",  # Frontend (NO trailing slash!)
 ]
+
+# Allow credentials (cookies, auth headers) in CORS requests
+CORS_ALLOW_CREDENTIALS = True
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 # Log database connection issues for debugging
