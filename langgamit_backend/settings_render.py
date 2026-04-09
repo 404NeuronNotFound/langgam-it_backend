@@ -11,7 +11,11 @@ from datetime import timedelta
 # In development: keep your hardcoded key in settings.py
 # On Render:      we override with the SECRET_KEY env var set in the dashboard
 
-SECRET_KEY = os.environ.get("SECRET_KEY", SECRET_KEY)   # falls back to dev key
+# Get SECRET_KEY from environment, or use the one from settings.py
+_secret_key = os.environ.get("SECRET_KEY")
+if _secret_key:
+    SECRET_KEY = _secret_key
+
 DEBUG      = os.environ.get("DEBUG", "True") == "True"  # False on Render
 
 # ── Allowed hosts ──────────────────────────────────────────────────────────────
