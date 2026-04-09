@@ -145,3 +145,12 @@ STATICFILES_STORAGE = 'whitenoise.storage.CompressedManifestStaticFilesStorage'
 
 CORS_ALLOW_ALL_ORIGINS = True
 CORS_ALLOW_CREDENTIALS = True
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Import production settings from settings_render.py
+# This overrides the above settings when running on Render
+# ─────────────────────────────────────────────────────────────────────────────
+try:
+    from .settings_render import *  # noqa: F401, F403
+except ImportError:
+    pass  # settings_render.py not available (local development)
