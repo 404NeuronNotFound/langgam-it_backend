@@ -44,11 +44,6 @@ if DATABASE_URL:
             default=DATABASE_URL,
             conn_max_age=600,
             conn_health_checks=True,
-            # Ensure connections are properly recycled
-            options={
-                'connect_timeout': 10,
-                'options': '-c statement_timeout=30000'
-            }
         )
     }
 else:
