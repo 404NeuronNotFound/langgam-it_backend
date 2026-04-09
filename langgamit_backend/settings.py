@@ -147,10 +147,51 @@ CORS_ALLOW_ALL_ORIGINS = True
 CORS_ALLOW_CREDENTIALS = True
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Import production settings from settings_render.py
-# This overrides the above settings when running on Render
+# Production Settings (Render)
 # ─────────────────────────────────────────────────────────────────────────────
-try:
-    from .settings_render import *  # noqa: F401, F403
-except ImportError:
-    pass  # settings_render.py not available (local development)
+
+import dj_database_url
+
+# Override SECRET_KEY from environment if available
+_env_secret_key = os.environ.get("SECRET_KEY")
+if _env_secret_key:
+    SECRET_KEY = _env_secret_key
+
+# Override DEBUG from environment
+DEBUG = os.environ.get("DEBUG", "True") == "True"
+
+# Add Render hostname to allowed hosts
+RENDER_HOST = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
+if RENDER_HOST:
+    ALLOWED_HOSTS.append(RENDER_HOST)
+
+# Configure database from DATABASE_URL if available
+DATABASE_URL = os.environ.get("DATABASE_URL")
+if DATABASE_URL:
+    try:
+        DATABASES = {
+            "default": dj_database_url.config(
+                default=DATABASE_URL,
+                conn_max_age=600,
+                conn_health_checks=True,
+            )
+        }
+    except Exception:
+        pass  # Keep default SQLite if DATABASE_URL is invalid
+
+# Configure CORS for production
+CORS_ALLOWED_ORIGINS = [
+    "http://localhost:5173",
+    "http://localhost:3000",
+    "https://langgam-it-by-keybeen.vercel.app",
+]
+
+# Configure sessions
+SESSION_ENGINE = "django.contrib.sessions.backends.db"
+SESSION_COOKIE_SECURE = not DEBUG
+SESSION_COOKIE_HTTPONLY = True
+SESSION_COOKIE_SAMESITE = "Lax"
+
+# Configure static files for production
+if not DEBUG:
+    STATICFILES_STORAGE = "whitenoise.storage.CompressedManifestStaticFilesStorage"
