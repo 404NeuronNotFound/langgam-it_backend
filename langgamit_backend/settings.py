@@ -169,35 +169,51 @@ if RENDER_HOST:
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if DATABASE_URL:
     try:
-        # Parse the database URL manually to handle special characters
-        import urllib.parse
+        # Try dj_database_url first
+        DATABASES = {
+            "default": dj_database_url.config(
+                default=DATABASE_URL,
+                conn_max_age=600,
+                conn_health_checks=True,
+            )
+        }
+    except Exception as e:
+        print(f"Warning: dj_database_url failed: {e}")
+        print("Attempting manual PostgreSQL parsing...")
         
-        # If it's a valid URL, use dj_database_url
-        if DATABASE_URL.startswith("postgresql://") or DATABASE_URL.startswith("postgres://"):
-            DATABASES = {
-                "default": dj_database_url.config(
-                    default=DATABASE_URL,
-                    conn_max_age=600,
-                    conn_health_checks=True,
-                )
-            }
-        else:
-            print(f"Warning: DATABASE_URL format not recognized: {DATABASE_URL[:50]}...")
+        # Manual parsing for PostgreSQL URLs with special characters
+        try:
+            import re
+            # Pattern: postgresql://user:password@host:port/database
+            pattern = r'postgresql://([^:]+):(.+)@([^:]+):(\d+)/(.+)'
+            match = re.match(pattern, DATABASE_URL)
+            
+            if match:
+                user, password, host, port, database = match.groups()
+                DATABASES = {
+                    'default': {
+                        'ENGINE': 'django.db.backends.postgresql',
+                        'NAME': database,
+                        'USER': user,
+                        'PASSWORD': password,
+                        'HOST': host,
+                        'PORT': port,
+                        'CONN_MAX_AGE': 600,
+                        'CONN_HEALTH_CHECKS': True,
+                    }
+                }
+                print(f"Successfully connected to PostgreSQL: {host}:{port}/{database}")
+            else:
+                raise ValueError("DATABASE_URL format not recognized")
+        except Exception as e2:
+            print(f"Error: Manual parsing also failed: {e2}")
+            print("Falling back to SQLite")
             DATABASES = {
                 'default': {
                     'ENGINE': 'django.db.backends.sqlite3',
                     'NAME': BASE_DIR / 'db.sqlite3',
                 }
             }
-    except Exception as e:
-        print(f"Error: Failed to parse DATABASE_URL: {e}")
-        print("Falling back to SQLite")
-        DATABASES = {
-            'default': {
-                'ENGINE': 'django.db.backends.sqlite3',
-                'NAME': BASE_DIR / 'db.sqlite3',
-            }
-        }
 else:
     # No DATABASE_URL set - use SQLite as fallback
     DATABASES = {
