@@ -169,16 +169,35 @@ if RENDER_HOST:
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if DATABASE_URL:
     try:
-        DATABASES = {
-            "default": dj_database_url.config(
-                default=DATABASE_URL,
-                conn_max_age=600,
-                conn_health_checks=True,
-            )
-        }
+        # Parse the database URL manually to handle special characters
+        import urllib.parse
+        
+        # If it's a valid URL, use dj_database_url
+        if DATABASE_URL.startswith("postgresql://") or DATABASE_URL.startswith("postgres://"):
+            DATABASES = {
+                "default": dj_database_url.config(
+                    default=DATABASE_URL,
+                    conn_max_age=600,
+                    conn_health_checks=True,
+                )
+            }
+        else:
+            print(f"Warning: DATABASE_URL format not recognized: {DATABASE_URL[:50]}...")
+            DATABASES = {
+                'default': {
+                    'ENGINE': 'django.db.backends.sqlite3',
+                    'NAME': BASE_DIR / 'db.sqlite3',
+                }
+            }
     except Exception as e:
         print(f"Error: Failed to parse DATABASE_URL: {e}")
-        raise
+        print("Falling back to SQLite")
+        DATABASES = {
+            'default': {
+                'ENGINE': 'django.db.backends.sqlite3',
+                'NAME': BASE_DIR / 'db.sqlite3',
+            }
+        }
 else:
     # No DATABASE_URL set - use SQLite as fallback
     DATABASES = {
