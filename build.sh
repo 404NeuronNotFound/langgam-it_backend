@@ -8,4 +8,6 @@ pip install --upgrade pip
 pip install -r requirements.txt
 
 python manage.py collectstatic --no-input
-python manage.py migrate
+
+# Skip migrations during build - will run after database is accessible
+# python manage.py migrate
