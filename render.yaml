@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: langgam-it-backend
+    env: python
+    plan: free
+    buildCommand: bash build.sh
+    startCommand: gunicorn langgamit_backend.wsgi:application --bind 0.0.0.0:$PORT
+    envVars:
+      - key: DEBUG
+        value: "False"
+      - key: PYTHON_VERSION
+        value: "3.11"

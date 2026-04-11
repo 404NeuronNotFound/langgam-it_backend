@@ -174,10 +174,24 @@ if DATABASE_URL:
                 default=DATABASE_URL,
                 conn_max_age=600,
                 conn_health_checks=True,
+                atomic_requests=True,
+                ssl_require=True,
             )
         }
-    except Exception:
-        pass  # Keep default SQLite if DATABASE_URL is invalid
+    except Exception as e:
+        print(f"Error: Failed to parse DATABASE_URL: {e}")
+        raise
+else:
+    # No DATABASE_URL set - use SQLite as fallback
+    DATABASES = {
+        'default': {
+            'ENGINE': 'django.db.backends.sqlite3',
+            'NAME': BASE_DIR / 'db.sqlite3',
+        }
+    }
+    if RENDER_HOST:
+        print("WARNING: DATABASE_URL not set on Render. Using SQLite (data will NOT persist).")
+        print("Please set DATABASE_URL environment variable with your Supabase connection string.")
 
 # Configure CORS for production
 CORS_ALLOWED_ORIGINS = [
