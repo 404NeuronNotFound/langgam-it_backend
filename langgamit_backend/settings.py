@@ -174,8 +174,6 @@ if DATABASE_URL:
                 default=DATABASE_URL,
                 conn_max_age=600,
                 conn_health_checks=True,
-                atomic_requests=True,
-                ssl_require=True,
             )
         }
     except Exception as e:
@@ -192,6 +190,9 @@ else:
     if RENDER_HOST:
         print("WARNING: DATABASE_URL not set on Render. Using SQLite (data will NOT persist).")
         print("Please set DATABASE_URL environment variable with your Supabase connection string.")
+
+# Enable atomic requests for database transactions
+ATOMIC_REQUESTS = True
 
 # Configure CORS for production
 CORS_ALLOWED_ORIGINS = [
