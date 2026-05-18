@@ -1,0 +1,201 @@
+
+<style>
+#erd { padding: 0.5rem 0; }
+#erd svg { max-width: 100%; }
+.erd-legend { display: flex; flex-wrap: wrap; gap: 12px; margin: 1rem 0 0; font-size: 12px; color: var(--color-text-secondary); }
+.erd-legend-item { display: flex; align-items: center; gap: 6px; }
+.erd-badge { width: 10px; height: 10px; border-radius: 3px; flex-shrink: 0; }
+</style>
+
+<div id="erd"></div>
+
+<div class="erd-legend">
+  <div class="erd-legend-item"><div class="erd-badge" style="background:#534AB7"></div>Auth / User</div>
+  <div class="erd-legend-item"><div class="erd-badge" style="background:#0F6E56"></div>Account &amp; Funds</div>
+  <div class="erd-legend-item"><div class="erd-badge" style="background:#185FA5"></div>Budget &amp; Cycles</div>
+  <div class="erd-legend-item"><div class="erd-badge" style="background:#854F0B"></div>Transactions</div>
+  <div class="erd-legend-item"><div class="erd-badge" style="background:#993C1D"></div>Monitoring</div>
+</div>
+
+<script type="module">
+import mermaid from 'https://esm.sh/mermaid@11/dist/mermaid.esm.min.mjs';
+const dark = matchMedia('(prefers-color-scheme: dark)').matches;
+await document.fonts.ready;
+mermaid.initialize({
+  startOnLoad: false,
+  theme: 'base',
+  fontFamily: '"Anthropic Sans", sans-serif',
+  themeVariables: {
+    darkMode: dark,
+    fontSize: '12px',
+    fontFamily: '"Anthropic Sans", sans-serif',
+    lineColor: dark ? '#9c9a92' : '#73726c',
+    textColor: dark ? '#c2c0b6' : '#3d3d3a',
+    primaryColor: dark ? '#26215C' : '#EEEDFE',
+    primaryBorderColor: dark ? '#AFA9EC' : '#534AB7',
+    primaryTextColor: dark ? '#EEEDFE' : '#26215C',
+  },
+});
+
+const diagram = `erDiagram
+  USER {
+    int id PK
+    string username
+    string first_name
+    string last_name
+    string email
+    string password
+    datetime created_at
+  }
+
+  FINANCIAL_ACCOUNT {
+    int id PK
+    int user_id FK
+    string name
+    datetime created_at
+  }
+
+  FUND {
+    int id PK
+    int account_id FK
+    string name
+    string type
+    string icon
+    string color
+    decimal current_balance
+    decimal monthly_allocation
+    int allocation_priority
+    bool skip_on_low_income
+    decimal target_amount
+    date target_date
+    string status
+    datetime created_at
+  }
+
+  MONTHLY_BUDGET_SETUP {
+    int id PK
+    int account_id FK
+    decimal estimated_monthly_income
+    decimal needs_budget
+    decimal wants_budget
+    date effective_from
+    datetime created_at
+  }
+
+  MONTH_CYCLE {
+    int id PK
+    int account_id FK
+    int budget_setup_id FK
+    int year
+    int month
+    decimal income_entered
+    string income_scenario
+    decimal needs_budget_used
+    decimal wants_budget_used
+    decimal needs_spent
+    decimal wants_spent
+    decimal remaining_budget
+    string status
+    datetime created_at
+  }
+
+  TRANSFER {
+    int id PK
+    int account_id FK
+    int cycle_id FK
+    int from_fund_id FK
+    int to_fund_id FK
+    decimal amount
+    string transfer_type
+    string note
+    date date
+    datetime created_at
+  }
+
+  EXPENSE {
+    int id PK
+    int account_id FK
+    int cycle_id FK
+    decimal amount
+    string category
+    string description
+    date date
+    datetime created_at
+  }
+
+  ALERT {
+    int id PK
+    int account_id FK
+    int cycle_id FK
+    string type
+    string message
+    bool is_read
+    datetime created_at
+  }
+
+  NET_WORTH_SNAPSHOT {
+    int id PK
+    int account_id FK
+    decimal net_worth
+    json snapshot_data
+    datetime captured_at
+  }
+
+  MONTH_SUMMARY {
+    int id PK
+    int account_id FK
+    int cycle_id FK
+    decimal total_income
+    decimal total_needs_spent
+    decimal total_wants_spent
+    decimal total_allocated_to_funds
+    decimal net_worth_start
+    decimal net_worth_end
+    datetime created_at
+  }
+
+  USER ||--|| FINANCIAL_ACCOUNT : "has one"
+  FINANCIAL_ACCOUNT ||--o{ FUND : "owns"
+  FINANCIAL_ACCOUNT ||--o{ MONTHLY_BUDGET_SETUP : "has"
+  FINANCIAL_ACCOUNT ||--o{ MONTH_CYCLE : "has"
+  FINANCIAL_ACCOUNT ||--o{ TRANSFER : "logs"
+  FINANCIAL_ACCOUNT ||--o{ EXPENSE : "tracks"
+  FINANCIAL_ACCOUNT ||--o{ ALERT : "receives"
+  FINANCIAL_ACCOUNT ||--o{ NET_WORTH_SNAPSHOT : "snapshots"
+  FINANCIAL_ACCOUNT ||--o{ MONTH_SUMMARY : "summarizes"
+  MONTHLY_BUDGET_SETUP ||--o{ MONTH_CYCLE : "used by"
+  MONTH_CYCLE ||--o{ TRANSFER : "contains"
+  MONTH_CYCLE ||--o{ EXPENSE : "contains"
+  MONTH_CYCLE ||--o{ ALERT : "triggers"
+  MONTH_CYCLE ||--o| MONTH_SUMMARY : "summarized by"
+  FUND ||--o{ TRANSFER : "from"
+  FUND ||--o{ TRANSFER : "to"
+`;
+
+const { svg } = await mermaid.render('erd-svg', diagram);
+document.getElementById('erd').innerHTML = svg;
+
+document.querySelectorAll('#erd svg .node').forEach(node => {
+  const firstPath = node.querySelector('path[d]');
+  if (!firstPath) return;
+  const d = firstPath.getAttribute('d');
+  const nums = d.match(/-?[\d.]+/g)?.map(Number);
+  if (!nums || nums.length < 8) return;
+  const xs = [nums[0], nums[2], nums[4], nums[6]];
+  const ys = [nums[1], nums[3], nums[5], nums[7]];
+  const x = Math.min(...xs), y = Math.min(...ys);
+  const w = Math.max(...xs) - x, h = Math.max(...ys) - y;
+  const rect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+  rect.setAttribute('x', x); rect.setAttribute('y', y);
+  rect.setAttribute('width', w); rect.setAttribute('height', h);
+  rect.setAttribute('rx', '8');
+  for (const a of ['fill', 'stroke', 'stroke-width', 'class', 'style']) {
+    if (firstPath.hasAttribute(a)) rect.setAttribute(a, firstPath.getAttribute(a));
+  }
+  firstPath.replaceWith(rect);
+});
+
+document.querySelectorAll('#erd svg .row-rect-odd path, #erd svg .row-rect-even path').forEach(p => {
+  p.setAttribute('stroke', 'none');
+});
+</script>
