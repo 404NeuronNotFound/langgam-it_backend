@@ -526,7 +526,7 @@ class Transfer(models.Model):
         is_create = self._state.adding
         with transaction.atomic():
             super().save(*args, **kwargs)
-            if is_create:
+            if is_create and not getattr(self, "_skip_balance_apply", False):
                 self.apply()
                 NetWorthSnapshot.capture(self.account)
 
@@ -583,7 +583,7 @@ class Expense(models.Model):
         is_create = self._state.adding
         with transaction.atomic():
             super().save(*args, **kwargs)
-            if is_create:
+            if is_create and getattr(self, "_apply_on_save", False):
                 self.apply()
                 self.run_monitoring()
                 NetWorthSnapshot.capture(self.account)
