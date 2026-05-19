@@ -1,485 +1,495 @@
-# api/services.py
-#
-# Allocation engine — pure business logic, no HTTP concerns.
-# Called by views; directly testable without HTTP layer.
-#
-# ── CORRECT ALLOCATION ORDER ──────────────────────────────────────────────────
-#
-#   income lands in cash_on_hand
-#       ↓
-#   Step 4  → spendable_budget (₱10,000: ₱7k needs + ₱3k wants) — PRIORITY #1
-#       ↓
-#   Step 5  → emergency_fund (₱10,000 per cycle, grows continuously) — PRIORITY #2
-#       ↓
-#   Step 6  → rigs_fund (up to ₱10,000 per cycle)
-#       ↓
-#   Step 7  → savings (up to ₱20,000 per cycle)
-#       ↓
-#   leftover stays in cash_on_hand for bills, extras, etc.
-#             these stay in cash_on_hand but are earmarked as "spendable"
-#             remaining_budget = ₱10,000
-#       ↓
-#   Step 6  → rigs_fund (up to ₱10,000 cap from cash_on_hand)
-#       ↓
-#   Step 7  → savings (up to ₱20,000 cap from cash_on_hand)
-#       ↓
-#   leftover stays in cash_on_hand for bills, extras, etc.
-#
-# ── SURVIVAL MODE (income == 0) ───────────────────────────────────────────────
-#
-#   IF cash_on_hand >= ₱5,000:
-#       expenses_budget = ₱5,000  (use existing cash_on_hand)
-#       wants_budget    = ₱0
-#       emergency_fund  = unchanged (no withdrawal needed)
-#
-#   ELSE (cash_on_hand < ₱5,000):
-#       draw from emergency_fund to top up cash_on_hand
-#       expenses_budget = whatever is available
-#       wants_budget    = ₱0
-#
-# ─────────────────────────────────────────────────────────────────────────────
-
 from decimal import Decimal
-import calendar
 from datetime import date
+import calendar
 
-from .models import Alert, AllocationLog, Expense, FinancialProfile, MonthCycle, NetWorthSnapshot, InvestmentAllocation
+from dateutil.relativedelta import relativedelta
+from django.db import transaction
+from django.db.models import Sum
+from django.utils import timezone
 
-
-# ── Constants ─────────────────────────────────────────────────────────────────
-
-EMERGENCY_FUND_ALLOCATION = Decimal("10000.00")  # Step 4  per cycle allocation
-RIGS_FUND_CAP            = Decimal("10000.00")   # Step 6  cap per cycle
-SAVINGS_CAP              = Decimal("20000.00")   # Step 7  cap per cycle
-
-EXPENSES_BUDGET_NORMAL   = Decimal("7000.00")    # Step 5  fixed needs allowance
-WANTS_BUDGET_NORMAL      = Decimal("3000.00")    # Step 5  fixed wants allowance
-EXPENSES_BUDGET_SURVIVAL = Decimal("5000.00")    # Step 10 reduced in survival mode
-
-
-# ── Helper ────────────────────────────────────────────────────────────────────
-
-def _log(cycle: MonthCycle, from_bucket: str, to_bucket: str, amount: Decimal) -> None:
-    """Write an AllocationLog entry. Silently skips zero-amount transfers."""
-    if amount > Decimal("0.00"):
-        AllocationLog.objects.create(
-            cycle=cycle,
-            from_bucket=from_bucket,
-            to_bucket=to_bucket,
-            amount=amount,
-        )
+from .models import (
+    FinancialAccount,
+    Fund,
+    MonthlyBudgetSetup,
+    MonthCycle,
+    Transfer,
+    Expense,
+    Alert,
+    NetWorthSnapshot,
+    MonthSummary,
+)
 
 
-# ── Main allocation engine ────────────────────────────────────────────────────
+EMERGENCY_THRESHOLD = Decimal("10000.00")
 
-def run_allocation_engine(
-    profile: FinancialProfile,
+
+def _save_fund_balance(fund: Fund) -> None:
+    fund._skip_snapshot = True
+    fund.save(update_fields=["current_balance"])
+
+
+def _create_transfer_record(
+    account: FinancialAccount,
+    cycle: MonthCycle | None,
+    from_fund: Fund | None,
+    to_fund: Fund | None,
+    amount: Decimal,
+    transfer_type: str,
+    note: str,
+    transfer_date: date,
+) -> Transfer:
+    transfer_obj = Transfer(
+        account=account,
+        cycle=cycle,
+        from_fund=from_fund,
+        to_fund=to_fund,
+        amount=amount,
+        transfer_type=transfer_type,
+        note=note,
+        date=transfer_date,
+    )
+    transfer_obj._skip_balance_apply = True
+    transfer_obj.save()
+    return transfer_obj
+
+
+def _months_between(start_date: date, end_date: date) -> int:
+    diff = relativedelta(end_date, start_date)
+    months = (diff.years * 12) + diff.months
+    if diff.days > 0:
+        months += 1
+    return max(1, months)
+
+
+# ── 1. run_setup_balances ──
+def run_setup_balances(account: FinancialAccount, balances: dict) -> NetWorthSnapshot:
+    # Apply initial balances to account funds and capture net worth.
+    with transaction.atomic():
+        for fund_id, amount in balances.items():
+            amount = Decimal(amount)
+            if amount <= Decimal("0.00"):
+                continue
+            try:
+                fund = Fund.objects.get(id=fund_id, account=account)
+            except Fund.DoesNotExist as exc:
+                raise ValueError("Fund does not belong to this account.") from exc
+            fund.current_balance = amount
+            _save_fund_balance(fund)
+        return NetWorthSnapshot.capture(account)
+
+
+# ── 2. run_income_allocation ──
+def run_income_allocation(
+    account: FinancialAccount,
     cycle: MonthCycle,
     income: Decimal,
 ) -> MonthCycle:
-    """
-    Execute the full monthly allocation pipeline.
+    # Allocate monthly income into funds and Cash on Hand.
+    with transaction.atomic():
+        income = Decimal(income)
+        budget_setup = MonthlyBudgetSetup.get_active(account)
+        if budget_setup is None:
+            raise ValueError("No active monthly budget setup found.")
 
-    Mutates `profile` and `cycle` in place, saves both, captures a
-    NetWorthSnapshot, and returns the updated cycle.
-
-    All bucket movements are deducted from cash_on_hand in sequence so the
-    remaining cash_on_hand after allocation represents genuinely unallocated
-    liquid money (bills, day-to-day extras).
-    """
-
-    cycle.income = income
-
-    # ── SURVIVAL MODE ─────────────────────────────────────────────────────────
-    if income == Decimal("0.00"):
-        # Check if user has enough cash_on_hand to cover survival expenses
-        # Only draw from emergency_fund if cash_on_hand is insufficient
-        
-        if profile.cash_on_hand >= EXPENSES_BUDGET_SURVIVAL:
-            # User has enough cash on hand, no need to touch emergency fund
-            cycle.expenses_budget       = EXPENSES_BUDGET_SURVIVAL
-            cycle.wants_budget          = Decimal("0.00")
-            cycle.remaining_budget      = EXPENSES_BUDGET_SURVIVAL
-            cycle.emergency_fund_budget = Decimal("0.00")
-            cycle.rigs_fund_budget      = Decimal("0.00")
-            cycle.savings_budget        = Decimal("0.00")
+        if income == Decimal("0.00"):
+            scenario = MonthCycle.SCENARIO_ZERO
+        elif income < budget_setup.estimated_monthly_income:
+            scenario = MonthCycle.SCENARIO_LOW
         else:
-            # Cash on hand is insufficient, draw from emergency fund
-            # Calculate how much we need from emergency fund
-            needed = EXPENSES_BUDGET_SURVIVAL - profile.cash_on_hand
-            draw = min(needed, profile.emergency_fund)
-            
-            profile.emergency_fund -= draw
-            profile.cash_on_hand   += draw
-            _log(cycle, "emergency_fund", "cash_on_hand", draw)
-            
-            cycle.emergency_fund_budget = Decimal("0.00")           # nothing went IN to EF
-            cycle.rigs_fund_budget      = Decimal("0.00")
-            cycle.savings_budget        = Decimal("0.00")
-            cycle.expenses_budget       = profile.cash_on_hand      # whatever is available
-            cycle.wants_budget          = Decimal("0.00")
-            cycle.remaining_budget      = profile.cash_on_hand
+            scenario = MonthCycle.SCENARIO_FULL
 
-        profile.save()
-        NetWorthSnapshot.capture(profile)
+        cycle.income_entered = income
+        cycle.income_scenario = scenario
+        cycle.needs_budget_used = budget_setup.needs_budget
+        cycle.wants_budget_used = budget_setup.wants_budget
+        cycle.remaining_budget = budget_setup.needs_budget + budget_setup.wants_budget
+
+        if scenario == MonthCycle.SCENARIO_ZERO:
+            cycle.save(
+                update_fields=[
+                    "income_entered",
+                    "income_scenario",
+                    "needs_budget_used",
+                    "wants_budget_used",
+                    "remaining_budget",
+                ]
+            )
+            return cycle
+
+        cash_on_hand_fund = Fund.objects.get(
+            account=account,
+            name=Fund.SYSTEM_CASH_ON_HAND,
+            type=Fund.TYPE_SYSTEM,
+        )
+        allocatable = income
+        transfer_date = timezone.localdate()
+
+        funds = (
+            Fund.objects.filter(account=account, status=Fund.STATUS_ACTIVE)
+            .exclude(id=cash_on_hand_fund.id)
+            .order_by("allocation_priority", "created_at")
+        )
+        for fund in funds:
+            if scenario == MonthCycle.SCENARIO_LOW and fund.skip_on_low_income:
+                continue
+            if allocatable <= Decimal("0.00"):
+                break
+
+            transfer_amount = min(fund.monthly_allocation, allocatable)
+            if transfer_amount <= Decimal("0.00"):
+                continue
+
+            fund.current_balance += transfer_amount
+            _save_fund_balance(fund)
+            allocatable -= transfer_amount
+
+            _create_transfer_record(
+                account=account,
+                cycle=cycle,
+                from_fund=None,
+                to_fund=fund,
+                amount=transfer_amount,
+                transfer_type=Transfer.TYPE_INCOME_ALLOCATION,
+                note=f"Monthly allocation — {fund.name}",
+                transfer_date=transfer_date,
+            )
+
+        if allocatable > Decimal("0.00"):
+            cash_on_hand_fund.current_balance += allocatable
+            _save_fund_balance(cash_on_hand_fund)
+            _create_transfer_record(
+                account=account,
+                cycle=cycle,
+                from_fund=None,
+                to_fund=cash_on_hand_fund,
+                amount=allocatable,
+                transfer_type=Transfer.TYPE_MONTH_END_CARRY,
+                note="Remaining income → Cash on Hand",
+                transfer_date=transfer_date,
+            )
+
         cycle.save()
+        NetWorthSnapshot.capture(account)
         return cycle
 
-    # ── NORMAL MODE ───────────────────────────────────────────────────────────
 
-    # Step 3 — income lands in cash_on_hand
-    profile.cash_on_hand += income
-    _log(cycle, "income", "cash_on_hand", income)
+# ── 3. run_survival_draw ──
+def run_survival_draw(account: FinancialAccount, cycle: MonthCycle) -> Transfer:
+    # Move Emergency Fund money into Cash on Hand for zero-income needs.
+    with transaction.atomic():
+        if cycle.income_scenario != MonthCycle.SCENARIO_ZERO:
+            raise ValueError("Survival draw is only available for zero-income cycles.")
 
-    # Track how much NEW income we have to allocate (not existing cash_on_hand)
-    allocatable_amount = income
-
-    # Step 4 — reserve spendable budget FIRST (priority #1: needs + wants)
-    # The ₱10,000 (₱7k needs + ₱3k wants) is reserved for living expenses
-    spendable = EXPENSES_BUDGET_NORMAL + WANTS_BUDGET_NORMAL   # ₱10,000
-    spendable_reserved = min(spendable, allocatable_amount)
-    
-    # Split the reserved amount proportionally if not enough for both
-    if spendable_reserved >= spendable:
-        cycle.expenses_budget = EXPENSES_BUDGET_NORMAL
-        cycle.wants_budget    = WANTS_BUDGET_NORMAL
-    else:
-        # Prioritise needs over wants if cash is tight
-        cycle.expenses_budget = min(EXPENSES_BUDGET_NORMAL, spendable_reserved)
-        cycle.wants_budget    = max(
-            Decimal("0.00"),
-            spendable_reserved - cycle.expenses_budget,
+        emergency_fund = Fund.objects.get(
+            account=account,
+            name=Fund.SYSTEM_EMERGENCY_FUND,
+            type=Fund.TYPE_SYSTEM,
         )
-    
-    cycle.remaining_budget = cycle.expenses_budget + cycle.wants_budget
-    
-    # Deduct from allocatable amount (but keep in cash_on_hand for spending)
-    allocatable_amount -= spendable_reserved
-    _log(cycle, "cash_on_hand", "spendable_budget", spendable_reserved)
-
-    # Step 5 — allocate ₱10,000 to emergency fund (priority #2)
-    # Emergency fund grows continuously as a safety net, no cap
-    # Only allocate if there's NEW income remaining after spendable budget
-    ef_transfer = min(EMERGENCY_FUND_ALLOCATION, allocatable_amount)
-    if ef_transfer > Decimal("0.00"):
-        profile.emergency_fund += ef_transfer
-        profile.cash_on_hand   -= ef_transfer
-        allocatable_amount     -= ef_transfer
-        _log(cycle, "cash_on_hand", "emergency_fund", ef_transfer)
-    cycle.emergency_fund_budget = ef_transfer
-
-    # Step 6 — rigs fund (up to ₱10,000 from remaining NEW income)
-    rigs_transfer = min(RIGS_FUND_CAP, allocatable_amount)
-    if rigs_transfer > Decimal("0.00"):
-        profile.rigs_fund      += rigs_transfer
-        profile.cash_on_hand   -= rigs_transfer
-        allocatable_amount     -= rigs_transfer
-        _log(cycle, "cash_on_hand", "rigs_fund", rigs_transfer)
-    cycle.rigs_fund_budget = rigs_transfer
-
-    # Step 7 — savings (up to ₱20,000 from remaining NEW income)
-    savings_transfer = min(SAVINGS_CAP, allocatable_amount)
-    if savings_transfer > Decimal("0.00"):
-        profile.savings        += savings_transfer
-        profile.cash_on_hand   -= savings_transfer
-        allocatable_amount     -= savings_transfer
-        _log(cycle, "cash_on_hand", "savings", savings_transfer)
-    cycle.savings_budget = savings_transfer
-
-    # Whatever remains from the NEW income stays in cash_on_hand
-    # (plus any existing cash_on_hand from previous months)
-
-    profile.save()
-    NetWorthSnapshot.capture(profile)
-    cycle.save()
-    return cycle
-
-
-# ── Invest engine ─────────────────────────────────────────────────────────────
-
-def run_invest(
-    profile: FinancialProfile,
-    cycle: MonthCycle,
-    amount: Decimal,
-) -> FinancialProfile:
-    """
-    Step 8 — Move `amount` from savings → investments_total.
-
-    Raises ValueError if the amount is non-positive or exceeds available savings.
-    Logs the transfer, updates InvestmentAllocation.total_allocated, and captures 
-    a NetWorthSnapshot.
-    """
-    if amount <= Decimal("0.00"):
-        raise ValueError("Investment amount must be positive.")
-
-    if amount > profile.savings:
-        raise ValueError(
-            f"Insufficient savings. "
-            f"Available: ₱{profile.savings:,.2f}, requested: ₱{amount:,.2f}."
+        cash_on_hand = Fund.objects.get(
+            account=account,
+            name=Fund.SYSTEM_CASH_ON_HAND,
+            type=Fund.TYPE_SYSTEM,
         )
 
-    profile.savings           -= amount
-    profile.investments_total += amount
-    profile.save()
+        draw_amount = min(cycle.needs_budget_used, emergency_fund.current_balance)
+        if draw_amount <= Decimal("0.00"):
+            raise ValueError("Emergency Fund is empty. Cannot draw for survival.")
 
-    _log(cycle, "savings", "investments_total", amount)
-    
-    # Update InvestmentAllocation.total_allocated to reflect the new investment budget
-    allocation, _ = InvestmentAllocation.objects.get_or_create(user=profile.user)
-    allocation.total_allocated += amount
-    allocation.save(update_fields=["total_allocated", "updated_at"])
-    
-    NetWorthSnapshot.capture(profile)
+        emergency_fund.current_balance -= draw_amount
+        _save_fund_balance(emergency_fund)
+        cash_on_hand.current_balance += draw_amount
+        _save_fund_balance(cash_on_hand)
 
-    return profile
-
-
-def run_divest(
-    profile: FinancialProfile,
-    cycle: MonthCycle,
-    amount: Decimal,
-) -> FinancialProfile:
-    """
-    Move `amount` from investments_total → savings (reverse of invest).
-
-    Raises ValueError if the amount is non-positive or exceeds available investments.
-    Logs the transfer, updates InvestmentAllocation.total_allocated, and captures 
-    a NetWorthSnapshot.
-    
-    Note: This moves money from the investments_total pool back to savings.
-    Individual Investment records should be updated separately to reflect
-    which specific assets were sold.
-    """
-    if amount <= Decimal("0.00"):
-        raise ValueError("Divestment amount must be positive.")
-
-    if amount > profile.investments_total:
-        raise ValueError(
-            f"Insufficient investments. "
-            f"Available: ₱{profile.investments_total:,.2f}, requested: ₱{amount:,.2f}."
-        )
-
-    profile.investments_total -= amount
-    profile.savings           += amount
-    profile.save()
-
-    _log(cycle, "investments_total", "savings", amount)
-    
-    # Update InvestmentAllocation.total_allocated to reflect the reduced investment budget
-    allocation, _ = InvestmentAllocation.objects.get_or_create(user=profile.user)
-    allocation.total_allocated = max(Decimal("0.00"), allocation.total_allocated - amount)
-    allocation.save(update_fields=["total_allocated", "updated_at"])
-    
-    NetWorthSnapshot.capture(profile)
-
-    return profile
-
-
-# ── Expense engine ────────────────────────────────────────────────────────────
-
-def run_expense(
-    profile: FinancialProfile,
-    cycle: MonthCycle,
-    expense: Expense,
-) -> list["Alert"]:
-    """
-    Steps 14 & 15 — Deduct an expense from remaining_budget and cash_on_hand,
-    then run the AI monitoring engine.
-
-    Deduction rules
-    ---------------
-    remaining_budget -= amount  (tracks what's left to spend)
-    cash_on_hand     -= amount  (actual money leaves the wallet)
-    
-    Note: expenses_budget and wants_budget stay at their allocated values
-    (7k and 3k). They represent the ALLOCATED amounts, not remaining amounts.
-    To see what's left in each category, calculate:
-        needs_remaining = expenses_budget - (total needs expenses)
-        wants_remaining = wants_budget - (total wants expenses)
-
-    Returns a list of Alert objects created by the monitoring engine.
-    """
-    amount = expense.amount
-
-    # Step 14 — deduct from remaining_budget only
-    # (expenses_budget and wants_budget stay at allocated values)
-    cycle.remaining_budget -= amount
-    cycle.save()
-
-    # Step 15 — deduct from cash_on_hand (actual money spent)
-    profile.cash_on_hand -= amount
-    profile.save()
-
-    # Capture net worth snapshot after expense deduction
-    NetWorthSnapshot.capture(profile)
-
-    # Step 16–19 — run AI monitoring engine and return any alerts created
-    return run_monitoring_engine(profile, cycle, expense)
-
-
-# ── AI Monitoring engine ──────────────────────────────────────────────────────
-
-EMERGENCY_FUND_THRESHOLD = Decimal("10000.00")
-
-
-def _create_alert(
-    user,
-    cycle: MonthCycle,
-    alert_type: str,
-    message: str,
-) -> "Alert":
-    """
-    Create a single Alert. Deduplicates within the same cycle — if an identical
-    unread alert already exists for this type + cycle, skip creating a new one.
-    """
-    exists = Alert.objects.filter(
-        user=user,
-        cycle=cycle,
-        type=alert_type,
-        is_read=False,
-    ).exists()
-
-    if not exists:
-        return Alert.objects.create(
-            user=user,
+        transfer_obj = _create_transfer_record(
+            account=account,
             cycle=cycle,
-            type=alert_type,
-            message=message,
+            from_fund=emergency_fund,
+            to_fund=cash_on_hand,
+            amount=draw_amount,
+            transfer_type=Transfer.TYPE_SURVIVAL_DRAW,
+            note="Emergency Fund covering needs — zero income month",
+            transfer_date=timezone.localdate(),
         )
-    return None
+        NetWorthSnapshot.capture(account)
+        return transfer_obj
 
 
-def run_monitoring_engine(
-    profile: FinancialProfile,
+# ── 4. run_transfer ──
+def run_transfer(
+    account: FinancialAccount,
+    cycle: MonthCycle | None,
+    from_fund: Fund | None,
+    to_fund: Fund | None,
+    amount: Decimal,
+    transfer_type: str,
+    note: str = "",
+    transfer_date: date | None = None,
+) -> Transfer:
+    # Apply a user-requested transfer between funds or from an external source.
+    with transaction.atomic():
+        amount = Decimal(amount)
+        if amount <= Decimal("0.00"):
+            raise ValueError("Transfer amount must be positive.")
+
+        if to_fund is None:
+            raise ValueError("A destination fund is required.")
+        if to_fund.account_id != account.id:
+            raise ValueError("Destination fund does not belong to this account.")
+        if from_fund is not None and from_fund.account_id != account.id:
+            raise ValueError("Source fund does not belong to this account.")
+        if from_fund is not None and from_fund == to_fund:
+            raise ValueError("Source and destination funds cannot be the same.")
+
+        if from_fund is not None and from_fund.current_balance < amount:
+            raise ValueError(
+                f"Insufficient balance in {from_fund.name}. "
+                f"Available: ₱{from_fund.current_balance:,.2f}, "
+                f"requested: ₱{amount:,.2f}."
+            )
+
+        note_required_types = [
+            Transfer.TYPE_FUND_TO_CASH,
+            Transfer.TYPE_EXTERNAL_ADD,
+            Transfer.TYPE_GOAL_COMPLETED,
+        ]
+        if transfer_type in note_required_types and not note.strip():
+            raise ValueError("A note is required for this transfer type.")
+
+        if from_fund is not None:
+            from_fund.current_balance -= amount
+            _save_fund_balance(from_fund)
+
+        to_fund.current_balance += amount
+        _save_fund_balance(to_fund)
+
+        transfer_obj = _create_transfer_record(
+            account=account,
+            cycle=cycle,
+            from_fund=from_fund,
+            to_fund=to_fund,
+            amount=amount,
+            transfer_type=transfer_type,
+            note=note,
+            transfer_date=transfer_date or timezone.localdate(),
+        )
+        NetWorthSnapshot.capture(account)
+        return transfer_obj
+
+
+# ── 5. run_expense ──
+def run_expense(
+    account: FinancialAccount,
     cycle: MonthCycle,
     expense: Expense,
-) -> list["Alert"]:
-    """
-    Runs after every expense. Evaluates Steps 16–19 in order and creates
-    Alert records for any thresholds that are breached.
+) -> list[Alert]:
+    # Deduct a persisted expense from Cash on Hand and run monitoring.
+    with transaction.atomic():
+        cash_on_hand = Fund.objects.get(
+            account=account,
+            name=Fund.SYSTEM_CASH_ON_HAND,
+            type=Fund.TYPE_SYSTEM,
+        )
 
-    Returns a list of the Alert objects that were created (may be empty).
+        if expense.amount > cash_on_hand.current_balance:
+            raise ValueError(
+                f"Insufficient Cash on Hand. "
+                f"Available: ₱{cash_on_hand.current_balance:,.2f}, "
+                f"requested: ₱{expense.amount:,.2f}."
+            )
 
-    Step 16 — Overspending check
-        expected_spend = (today_day / total_days_in_month) * total_budget
-        IF actual_spend > expected_spend → ALERT overspend
+        cash_on_hand.current_balance -= expense.amount
+        _save_fund_balance(cash_on_hand)
 
-    Step 17 — Daily limit check (flexible guideline)
-        daily_limit = remaining_budget / total_days_in_month
-        IF today_spent > (daily_limit * 2) → ALERT daily_limit
-        (Allows for big shopping days without constant alerts)
+        if expense.category == Expense.CATEGORY_NEEDS:
+            cycle.needs_spent += expense.amount
+        else:
+            cycle.wants_spent += expense.amount
 
-    Step 18 — Hard stop
-        IF remaining_budget <= 0 → ALERT hard_stop
+        cycle.remaining_budget -= expense.amount
+        cycle.save(update_fields=["needs_spent", "wants_spent", "remaining_budget"])
 
-    Step 19 — Emergency fund warning
-        IF emergency_fund < 10,000 → ALERT emergency_low
-    """
-    today          = expense.date
-    total_days     = calendar.monthrange(today.year, today.month)[1]
-    day_of_month   = today.day
-    remaining_days = max(1, total_days - day_of_month)   # never divide by zero
+        NetWorthSnapshot.capture(account)
+        return run_monitoring_engine(account, cycle, expense)
 
-    # Total budget for this cycle (expenses + wants combined)
-    total_budget = cycle.expenses_budget + cycle.wants_budget + (
-        # add back what's already been spent to get the original budget
-        Decimal("0.00")   # remaining_budget already reflects deductions
-    )
 
-    # Actual spend = original_budget - remaining_budget
-    # Original budget = remaining_budget + amount already spent
-    # We derive it from cycle fields rather than summing all expenses
-    original_budget = (
-        cycle.expenses_budget
-        + cycle.wants_budget
-        + cycle.remaining_budget.to_integral_value()    # avoid rounding drift
-    )
-    # Simpler: query total expenses for this cycle
-    actual_spend = (
-        Expense.objects
-        .filter(cycle=cycle)
-        .values_list("amount", flat=True)
-    )
-    actual_spend = sum(actual_spend, Decimal("0.00"))
+# ── 6. run_monitoring_engine ──
+def run_monitoring_engine(
+    account: FinancialAccount,
+    cycle: MonthCycle,
+    expense: Expense,
+) -> list[Alert]:
+    # Create spending and goal alerts after an expense without raising exceptions.
+    created_alerts = []
+    try:
+        today = expense.date
+        total_days = calendar.monthrange(today.year, today.month)[1]
+        day_of_month = today.day
 
-    # Derive original budget = actual_spend + remaining_budget
-    # (remaining_budget is already post-deduction from this expense)
-    original_budget = actual_spend + cycle.remaining_budget
+        actual_spend = (
+            Expense.objects.filter(cycle=cycle).aggregate(total=Sum("amount"))["total"]
+            or Decimal("0.00")
+        )
+        original_budget = actual_spend + cycle.remaining_budget
+        daily_limit = cycle.remaining_budget / Decimal(max(1, total_days - day_of_month))
+        today_spent = (
+            Expense.objects.filter(cycle=cycle, date=today).aggregate(total=Sum("amount"))[
+                "total"
+            ]
+            or Decimal("0.00")
+        )
 
-    created_alerts: list[Alert] = []
+        Fund.objects.get(
+            account=account,
+            name=Fund.SYSTEM_CASH_ON_HAND,
+            type=Fund.TYPE_SYSTEM,
+        )
+        emergency_fund = Fund.objects.get(
+            account=account,
+            name=Fund.SYSTEM_EMERGENCY_FUND,
+            type=Fund.TYPE_SYSTEM,
+        )
 
-    # ── Step 16: Overspending check ───────────────────────────────────────────
-    if original_budget > Decimal("0.00"):
-        expected_spend = (Decimal(day_of_month) / Decimal(total_days)) * original_budget
-        if actual_spend > expected_spend:
+        if original_budget > Decimal("0.00"):
+            expected_spend = (
+                Decimal(day_of_month) / Decimal(total_days)
+            ) * original_budget
+            if actual_spend > expected_spend:
+                alert = _create_alert(
+                    account,
+                    cycle,
+                    Alert.TYPE_OVERSPEND,
+                    f"You're ahead of pace. Expected ₱{expected_spend:,.2f} by day "
+                    f"{day_of_month}, actual spend ₱{actual_spend:,.2f}.",
+                )
+                if alert:
+                    created_alerts.append(alert)
+
+        if today_spent > daily_limit and daily_limit > Decimal("0.00"):
             alert = _create_alert(
-                user       = expense.user,
-                cycle      = cycle,
-                alert_type = Alert.TYPE_OVERSPEND,
-                message    = (
-                    f"You're overspending. "
-                    f"Expected spend by day {day_of_month}: ₱{expected_spend:,.2f}. "
-                    f"Actual spend: ₱{actual_spend:,.2f}."
-                ),
+                account,
+                cycle,
+                Alert.TYPE_DAILY_LIMIT,
+                f"High spending day. Suggested daily limit ₱{daily_limit:,.2f}, "
+                f"today's spend ₱{today_spent:,.2f}.",
             )
             if alert:
                 created_alerts.append(alert)
 
-    # ── Step 17: Daily limit check ────────────────────────────────────────────
-    # Use total days in month for flexible daily guideline
-    daily_limit = cycle.remaining_budget / Decimal(total_days) if total_days > 0 else Decimal("0.00")
+        if cycle.remaining_budget <= Decimal("0.00"):
+            alert = _create_alert(
+                account,
+                cycle,
+                Alert.TYPE_HARD_STOP,
+                "Monthly budget fully used. Further spending comes from "
+                "unallocated Cash on Hand.",
+            )
+            if alert:
+                created_alerts.append(alert)
 
-    today_spent = (
-        Expense.objects
-        .filter(cycle=cycle, date=today)
-        .values_list("amount", flat=True)
-    )
-    today_spent = sum(today_spent, Decimal("0.00"))
+        if emergency_fund.current_balance < EMERGENCY_THRESHOLD:
+            alert = _create_alert(
+                account,
+                cycle,
+                Alert.TYPE_EMERGENCY_LOW,
+                f"Emergency Fund is ₱{emergency_fund.current_balance:,.2f}. "
+                f"Target is ₱{EMERGENCY_THRESHOLD:,.2f}. "
+                f"Prioritise topping it up next income entry.",
+            )
+            if alert:
+                created_alerts.append(alert)
 
-    # Only alert if significantly over the flexible daily limit (e.g., 2x)
-    # This allows for big shopping days without constant alerts
-    if today_spent > (daily_limit * Decimal("2.0")):
-        alert = _create_alert(
-            user       = expense.user,
-            cycle      = cycle,
-            alert_type = Alert.TYPE_DAILY_LIMIT,
-            message    = (
-                f"High spending day. "
-                f"Suggested daily limit: ₱{daily_limit:,.2f}. "
-                f"Today's spend: ₱{today_spent:,.2f}. "
-                f"Remember to balance with lighter spending days."
-            ),
+        goal_funds = Fund.objects.filter(
+            account=account,
+            type=Fund.TYPE_GOAL,
+            status=Fund.STATUS_ACTIVE,
+            target_amount__isnull=False,
+            target_date__isnull=False,
         )
-        if alert:
-            created_alerts.append(alert)
-
-    # ── Step 18: Hard stop ────────────────────────────────────────────────────
-    if cycle.remaining_budget <= Decimal("0.00"):
-        alert = _create_alert(
-            user       = expense.user,
-            cycle      = cycle,
-            alert_type = Alert.TYPE_HARD_STOP,
-            message    = (
-                "STOP SPENDING. Your monthly budget has been fully used up. "
-                "Any further spending comes out of your unallocated cash."
-            ),
-        )
-        if alert:
-            created_alerts.append(alert)
-
-    # ── Step 19: Emergency fund warning ──────────────────────────────────────
-    if profile.emergency_fund < EMERGENCY_FUND_THRESHOLD:
-        alert = _create_alert(
-            user       = expense.user,
-            cycle      = cycle,
-            alert_type = Alert.TYPE_EMERGENCY_LOW,
-            message    = (
-                f"Emergency fund is low: ₱{profile.emergency_fund:,.2f}. "
-                f"Target is ₱{EMERGENCY_FUND_THRESHOLD:,.2f}. "
-                f"Prioritise topping it up next month."
-            ),
-        )
-        if alert:
-            created_alerts.append(alert)
+        for fund in goal_funds:
+            months_left = _months_between(today, fund.target_date)
+            needed_per_month = (
+                fund.target_amount - fund.current_balance
+            ) / Decimal(months_left)
+            if (
+                needed_per_month > fund.monthly_allocation
+                and fund.monthly_allocation > Decimal("0.00")
+            ):
+                alert = _create_alert(
+                    account,
+                    cycle,
+                    Alert.TYPE_GOAL_BEHIND,
+                    f"{fund.name} is behind pace. Need ₱{needed_per_month:,.2f}/month "
+                    f"but only ₱{fund.monthly_allocation:,.2f} allocated.",
+                )
+                if alert:
+                    created_alerts.append(alert)
+    except Exception:
+        return created_alerts
 
     return created_alerts
+
+
+# ── 7. run_close_month ──
+def run_close_month(account: FinancialAccount, cycle: MonthCycle) -> MonthSummary:
+    # Close a cycle and create or update its end-of-month summary.
+    with transaction.atomic():
+        net_worth_start = (
+            NetWorthSnapshot.objects.filter(
+                account=account,
+                captured_at__gte=cycle.created_at,
+            )
+            .order_by("captured_at")
+            .first()
+        )
+        net_worth_start_val = (
+            net_worth_start.net_worth if net_worth_start else Decimal("0.00")
+        )
+
+        final_snapshot = NetWorthSnapshot.capture(account)
+        total_allocated = (
+            Transfer.objects.filter(
+                account=account,
+                cycle=cycle,
+                transfer_type=Transfer.TYPE_INCOME_ALLOCATION,
+            ).aggregate(total=Sum("amount"))["total"]
+            or Decimal("0.00")
+        )
+
+        summary, _ = MonthSummary.objects.update_or_create(
+            account=account,
+            cycle=cycle,
+            defaults={
+                "total_income": cycle.income_entered,
+                "total_needs_spent": cycle.needs_spent,
+                "total_wants_spent": cycle.wants_spent,
+                "total_allocated_to_funds": total_allocated,
+                "net_worth_start": net_worth_start_val,
+                "net_worth_end": final_snapshot.net_worth,
+            },
+        )
+
+        cycle.status = MonthCycle.STATUS_CLOSED
+        cycle.save(update_fields=["status"])
+        return summary
+
+
+def _create_alert(
+    account: FinancialAccount,
+    cycle: MonthCycle,
+    alert_type: str,
+    message: str,
+) -> Alert | None:
+    exists = Alert.objects.filter(
+        account=account,
+        cycle=cycle,
+        type=alert_type,
+        is_read=False,
+    ).exists()
+    if exists:
+        return None
+    return Alert.objects.create(
+        account=account,
+        cycle=cycle,
+        type=alert_type,
+        message=message,
+    )
