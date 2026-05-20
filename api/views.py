@@ -1,60 +1,121 @@
-# api/views.py
-
-import calendar
+from decimal import Decimal, InvalidOperation
 from datetime import date
-from decimal import Decimal
+import calendar
 
 from django.contrib.auth.models import User
-from django.db import models
+from django.db import models as django_models
+from django.db.models import Sum
 from django.utils import timezone
 from rest_framework import generics, permissions, status
+from rest_framework.exceptions import ValidationError
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework_simplejwt.views import TokenObtainPairView
 
-from .models import Alert, Expense, FinancialProfile, MonthCycle, NetWorthSnapshot, Investment, MonthSummary, InvestmentAllocation
-from .serializers import (
-    AlertSerializer,
-    ChangePasswordSerializer,
-    CustomTokenObtainPairSerializer,
-    ExpenseSerializer,
-    FinancialProfileSerializer,
-    InvestmentAllocationSerializer,
-    InvestmentSerializer,
-    MonthCycleSerializer,
-    MonthSummarySerializer,
-    NetWorthSnapshotSerializer,
-    RegisterSerializer,
-    UserProfileSerializer,
-    UserSerializer,
+from .models import (
+    FinancialAccount,
+    Fund,
+    MonthlyBudgetSetup,
+    MonthCycle,
+    Transfer,
+    Expense,
+    Alert,
+    NetWorthSnapshot,
+    MonthSummary,
 )
-from .services import run_allocation_engine, run_expense, run_invest, run_divest
+from .serializers import (
+    RegisterSerializer,
+    UserSerializer,
+    CustomTokenObtainPairSerializer,
+    FinancialAccountSerializer,
+    FundSerializer,
+    FundCreateSerializer,
+    MonthlyBudgetSetupSerializer,
+    MonthCycleSerializer,
+    TransferSerializer,
+    TransferCreateSerializer,
+    ExpenseSerializer,
+    AlertSerializer,
+    NetWorthSnapshotSerializer,
+    MonthSummarySerializer,
+)
+from .services import (
+    run_setup_balances,
+    run_income_allocation,
+    run_survival_draw,
+    run_transfer,
+    run_expense,
+    run_close_month,
+)
 
 
-# ──────────────────────────────────────────────────────────────────────
-# 1. Register  →  POST /api/auth/register/
-# ──────────────────────────────────────────────────────────────────────
+def _get_account(user) -> FinancialAccount | None:
+    """Get the user's FinancialAccount or None."""
+    try:
+        return FinancialAccount.objects.get(user=user)
+    except FinancialAccount.DoesNotExist:
+        return None
 
+
+def _account_not_found_response() -> Response:
+    return Response(
+        {"detail": "Financial account not found. Complete setup first."},
+        status=status.HTTP_404_NOT_FOUND,
+    )
+
+
+def _parse_decimal(value, field_name="amount") -> Decimal:
+    """Parse a decimal from request data."""
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        raise ValidationError({field_name: "Enter a valid number."})
+
+
+def _get_system_fund_or_404(account: FinancialAccount, name: str):
+    try:
+        return Fund.objects.get(account=account, name=name, type=Fund.TYPE_SYSTEM)
+    except Fund.DoesNotExist:
+        return None
+
+
+def _parse_iso_date(value):
+    if not value:
+        return None
+    try:
+        return date.fromisoformat(value)
+    except (TypeError, ValueError):
+        raise ValidationError({"date": "Enter a valid date in YYYY-MM-DD format."})
+
+
+def _account_profile(account) -> dict:
+    """
+    Returns a snapshot of the account's current financial state.
+    Used in almost every response so the frontend can update in one shot.
+    """
+    funds = Fund.objects.filter(account=account, status=Fund.STATUS_ACTIVE)
+    net_worth = funds.aggregate(total=Sum("current_balance"))["total"] or Decimal("0.00")
+    cycle = MonthCycle.objects.filter(
+        account=account,
+        status=MonthCycle.STATUS_ACTIVE,
+    ).first()
+
+    return {
+        "net_worth": str(net_worth),
+        "funds": FundSerializer(
+            funds.order_by("allocation_priority"),
+            many=True,
+        ).data,
+        "active_cycle": MonthCycleSerializer(cycle).data if cycle else None,
+    }
+
+
+# ── AUTH ──
 class RegisterView(generics.CreateAPIView):
-    """
-    Create a new user account. No authentication required.
+    """Create a new user account."""
 
-    Request body:
-        {
-            "username":         "juandelacruz",
-            "first_name":       "Juan",
-            "last_name":        "dela Cruz",
-            "email":            "juan@example.com",
-            "password":         "StrongPass123!",
-            "confirm_password": "StrongPass123!"
-        }
-
-    Success 201:
-        { "message": "Account created successfully.", "user": { ... } }
-    """
-
-    queryset           = User.objects.all()
-    serializer_class   = RegisterSerializer
+    queryset = User.objects.all()
+    serializer_class = RegisterSerializer
     permission_classes = [permissions.AllowAny]
 
     def create(self, request, *args, **kwargs):
@@ -64,1340 +125,955 @@ class RegisterView(generics.CreateAPIView):
         return Response(
             {
                 "message": "Account created successfully.",
-                "user":    UserSerializer(user).data,
+                "user": UserSerializer(user).data,
             },
             status=status.HTTP_201_CREATED,
         )
 
 
-# ──────────────────────────────────────────────────────────────────────
-# 2. Login  →  POST /api/auth/token/
-# ──────────────────────────────────────────────────────────────────────
-
 class CustomTokenObtainPairView(TokenObtainPairView):
-    """
-    Authenticate with username + password.
-    Returns access token (30 min), refresh token (1 day), and basic user info.
-    """
+    """Authenticate and return JWT tokens plus user info."""
 
-    serializer_class   = CustomTokenObtainPairSerializer
+    serializer_class = CustomTokenObtainPairSerializer
     permission_classes = [permissions.AllowAny]
 
 
-# ──────────────────────────────────────────────────────────────────────
-# 3. Current user  →  GET /api/auth/me/
-# ──────────────────────────────────────────────────────────────────────
-
 class MeView(APIView):
-    """Return the authenticated user's profile."""
+    """Return the authenticated user."""
 
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request):
-        return Response(
-            UserSerializer(request.user).data,
-            status=status.HTTP_200_OK,
-        )
+        return Response(UserSerializer(request.user).data, status=status.HTTP_200_OK)
 
 
-# ──────────────────────────────────────────────────────────────────────
-# 4. Financial Profile  →  GET / PATCH /api/finance/profile/
-# ──────────────────────────────────────────────────────────────────────
-
-class FinancialProfileView(APIView):
-    """
-    GET  — returns current bucket values + live net_worth.
-    PATCH — updates one or more buckets + captures a NetWorthSnapshot.
-
-    All five bucket fields are optional in a PATCH.
-    """
+# ── ACCOUNT ──
+class FinancialAccountView(APIView):
+    """Read or update the authenticated user's financial account."""
 
     permission_classes = [permissions.IsAuthenticated]
 
-    def _get_or_create_profile(self, user) -> FinancialProfile:
-        profile, _ = FinancialProfile.objects.get_or_create(user=user)
-        return profile
-
     def get(self, request):
-        profile = self._get_or_create_profile(request.user)
-        return Response(
-            FinancialProfileSerializer(profile).data,
-            status=status.HTTP_200_OK,
-        )
+        account = _get_account(request.user)
+        if account is None:
+            return _account_not_found_response()
+        return Response(FinancialAccountSerializer(account).data)
 
     def patch(self, request):
-        profile    = self._get_or_create_profile(request.user)
-        serializer = FinancialProfileSerializer(profile, data=request.data, partial=True)
+        account = _get_account(request.user)
+        if account is None:
+            return _account_not_found_response()
+        serializer = FinancialAccountSerializer(account, data=request.data, partial=True)
         serializer.is_valid(raise_exception=True)
-        
-        # Store old values to detect if anything actually changed
-        old_net_worth = profile.net_worth
-        
         serializer.save()
-        
-        # Only capture snapshot if net worth actually changed
-        # This prevents duplicate snapshots when frontend sends multiple PATCH requests
-        new_net_worth = profile.net_worth
-        if new_net_worth != old_net_worth:
-            NetWorthSnapshot.capture(profile)
-        
-        return Response(serializer.data, status=status.HTTP_200_OK)
+        return Response(
+            {
+                "account": serializer.data,
+                "profile": _account_profile(account),
+            },
+            status=status.HTTP_200_OK,
+        )
 
 
-# ──────────────────────────────────────────────────────────────────────
-# 5. Net Worth History  →  GET /api/finance/snapshots/
-# ──────────────────────────────────────────────────────────────────────
-
-class NetWorthSnapshotListView(generics.ListAPIView):
-    """Return the authenticated user's net-worth history, newest first."""
-
-    serializer_class   = NetWorthSnapshotSerializer
-    permission_classes = [permissions.IsAuthenticated]
-
-    def get_queryset(self):
-        return NetWorthSnapshot.objects.filter(user=self.request.user)
-
-
-# ──────────────────────────────────────────────────────────────────────
-# 6. Income + Allocation Engine  →  POST /api/income/
-# ──────────────────────────────────────────────────────────────────────
-
-class IncomeView(APIView):
-    """
-    Record monthly income and run the full allocation pipeline.
-
-    POST  /api/income/
-
-    Request body:
-        {
-            "income": "35000.00",   -- required; "0" activates survival mode
-            "year":   2026,         -- optional; defaults to current UTC year
-            "month":  3             -- optional; defaults to current UTC month
-        }
-
-    Allocation order (normal mode):
-        income → cash_on_hand
-             → spendable budget (₱10,000: ₱7k needs + ₱3k wants) — PRIORITY #1
-             → emergency_fund   (₱10,000 per cycle, grows continuously) — PRIORITY #2
-             → rigs_fund        (up to ₱10,000)
-             → savings          (up to ₱20,000)
-             → remainder stays in cash_on_hand
-
-    Success 200:
-        { "cycle": { ... }, "profile": { ... } }
-    """
+class FinancialResetView(APIView):
+    """Reset all transaction data while preserving funds and budget setup."""
 
     permission_classes = [permissions.IsAuthenticated]
 
     def post(self, request):
-        # Accept either "income" or "amount" as the income field name
-        raw = request.data.get("income") or request.data.get("amount") or "0"
-        try:
-            income = Decimal(str(raw))
-        except Exception:
+        account = _get_account(request.user)
+        if account is None:
+            return _account_not_found_response()
+
+        Fund.objects.filter(account=account).update(current_balance=Decimal("0.00"))
+        MonthCycle.objects.filter(account=account).delete()
+        Transfer.objects.filter(account=account).delete()
+        Expense.objects.filter(account=account).delete()
+        Alert.objects.filter(account=account).delete()
+        NetWorthSnapshot.objects.filter(account=account).delete()
+        MonthSummary.objects.filter(account=account).delete()
+
+        return Response(
+            {
+                "message": "Financial data reset. Your funds and budget setup are preserved.",
+                "profile": _account_profile(account),
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+# ── SETUP ──
+class SetupStatusView(APIView):
+    """Return setup completion flags for the authenticated user."""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        account = _get_account(request.user)
+        has_account = account is not None
+        has_custom_funds = (
+            Fund.objects.filter(account=account, type=Fund.TYPE_GOAL).exists()
+            if account
+            else False
+        )
+        has_balances = (
+            Fund.objects.filter(
+                account=account,
+                current_balance__gt=Decimal("0.00"),
+            ).exists()
+            if account
+            else False
+        )
+        has_budget = (
+            MonthlyBudgetSetup.objects.filter(account=account).exists()
+            if account
+            else False
+        )
+
+        return Response(
+            {
+                "has_account": has_account,
+                "has_custom_funds": has_custom_funds,
+                "has_balances": has_balances,
+                "has_budget": has_budget,
+                "setup_complete": all(
+                    [has_account, has_custom_funds, has_balances, has_budget]
+                ),
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+class SetupBalancesView(APIView):
+    """Save initial fund balances from the setup wizard."""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        account = _get_account(request.user)
+        if account is None:
+            return _account_not_found_response()
+
+        raw = request.data.get("balances", {})
+        if not isinstance(raw, dict) or not raw:
             return Response(
-                {"error": "Invalid income value."},
+                {"error": "Provide a balances dict of {fund_id: amount}."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        if income < Decimal("0"):
+        balances = {}
+        for fund_id, amount in raw.items():
+            try:
+                balances[int(fund_id)] = _parse_decimal(
+                    amount,
+                    field_name=f"balances.{fund_id}",
+                )
+            except (TypeError, ValueError):
+                return Response(
+                    {"error": f"Invalid fund id: {fund_id}."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        try:
+            snapshot = run_setup_balances(account, balances)
+        except ValueError as exc:
+            return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        funds = Fund.objects.filter(account=account).order_by("allocation_priority")
+        return Response(
+            {
+                "message": "Balances saved.",
+                "net_worth": snapshot.net_worth,
+                "funds": FundSerializer(funds, many=True).data,
+                "profile": _account_profile(account),
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+class SetupBudgetView(APIView):
+    """Create the first monthly budget setup."""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        account = _get_account(request.user)
+        if account is None:
+            return _account_not_found_response()
+
+        data = request.data.copy()
+        if "effective_from" not in data:
+            data["effective_from"] = str(timezone.localdate())
+
+        serializer = MonthlyBudgetSetupSerializer(
+            data=data,
+            context={"account": account},
+        )
+        serializer.is_valid(raise_exception=True)
+        setup = serializer.save(account=account)
+
+        return Response(
+            {
+                "budget": MonthlyBudgetSetupSerializer(
+                    setup,
+                    context={"account": account},
+                ).data,
+                "profile": _account_profile(account),
+            },
+            status=status.HTTP_201_CREATED,
+        )
+
+
+# ── FUNDS ──
+class FundListCreateView(APIView):
+    """List funds or create a new goal fund."""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        account = _get_account(request.user)
+        if account is None:
+            return _account_not_found_response()
+        funds = Fund.objects.filter(account=account).order_by("allocation_priority")
+        return Response(FundSerializer(funds, many=True).data, status=status.HTTP_200_OK)
+
+    def post(self, request):
+        account = _get_account(request.user)
+        if account is None:
+            return _account_not_found_response()
+
+        serializer = FundCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        last_priority = (
+            Fund.objects.filter(account=account)
+            .order_by("-allocation_priority")
+            .first()
+        )
+        next_priority = (last_priority.allocation_priority + 1) if last_priority else 4
+
+        fund = serializer.save(
+            account=account,
+            type=Fund.TYPE_GOAL,
+            allocation_priority=next_priority,
+            skip_on_low_income=True,
+        )
+        return Response(
+            {
+                "fund": FundSerializer(fund).data,
+                "profile": _account_profile(account),
+            },
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class FundDetailView(APIView):
+    """Retrieve or update one fund scoped to the current account."""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    allowed_patch_fields = {
+        "name",
+        "icon",
+        "color",
+        "monthly_allocation",
+        "allocation_priority",
+        "skip_on_low_income",
+        "target_amount",
+        "target_date",
+    }
+
+    def _get_fund(self, request, pk):
+        account = _get_account(request.user)
+        if account is None:
+            return None, None
+        try:
+            return account, Fund.objects.get(pk=pk, account=account)
+        except Fund.DoesNotExist:
+            return account, None
+
+    def get(self, request, pk):
+        account, fund = self._get_fund(request, pk)
+        if account is None:
+            return _account_not_found_response()
+        if fund is None:
+            return Response({"detail": "Fund not found."}, status=status.HTTP_404_NOT_FOUND)
+        return Response(FundSerializer(fund).data, status=status.HTTP_200_OK)
+
+    def patch(self, request, pk):
+        account, fund = self._get_fund(request, pk)
+        if account is None:
+            return _account_not_found_response()
+        if fund is None:
+            return Response({"detail": "Fund not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        data = {
+            key: value
+            for key, value in request.data.items()
+            if key in self.allowed_patch_fields
+        }
+        if fund.type == Fund.TYPE_SYSTEM:
+            data.pop("name", None)
+
+        serializer = FundSerializer(fund, data=data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        fund = serializer.save()
+
+        return Response(
+            {
+                "fund": FundSerializer(fund).data,
+                "profile": _account_profile(account),
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+class FundReorderView(APIView):
+    """Reorder funds by allocation priority."""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        account = _get_account(request.user)
+        if account is None:
+            return _account_not_found_response()
+
+        order = request.data.get("order", [])
+        if not isinstance(order, list):
+            return Response(
+                {"error": "Provide an order list of fund IDs."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        for priority, fund_id in enumerate(order, start=1):
+            Fund.objects.filter(id=fund_id, account=account).update(
+                allocation_priority=priority,
+            )
+
+        funds = Fund.objects.filter(account=account).order_by("allocation_priority")
+        return Response(
+            {
+                "funds": FundSerializer(funds, many=True).data,
+                "profile": _account_profile(account),
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+class FundCloseFundView(APIView):
+    """Close a goal fund and move its remaining balance to Cash on Hand."""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, pk):
+        account = _get_account(request.user)
+        if account is None:
+            return _account_not_found_response()
+        try:
+            fund = Fund.objects.get(pk=pk, account=account)
+        except Fund.DoesNotExist:
+            return Response({"detail": "Fund not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        if fund.type == Fund.TYPE_SYSTEM:
+            return Response(
+                {"error": "System funds cannot be closed."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        note = request.data.get("note", "").strip()
+        if not note:
+            return Response(
+                {"error": "A note is required when closing a fund."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        cash_on_hand = _get_system_fund_or_404(account, Fund.SYSTEM_CASH_ON_HAND)
+        if cash_on_hand is None:
+            return Response(
+                {"detail": "Cash on Hand fund not found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        remaining = fund.current_balance
+        if remaining > Decimal("0.00"):
+            try:
+                run_transfer(
+                    account=account,
+                    cycle=None,
+                    from_fund=fund,
+                    to_fund=cash_on_hand,
+                    amount=remaining,
+                    transfer_type=Transfer.TYPE_GOAL_COMPLETED,
+                    note=note,
+                )
+            except ValueError as exc:
+                return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        fund.close(note=note)
+        fund.refresh_from_db()
+        return Response(
+            {
+                "message": f"{fund.name} closed. ₱{remaining:,.2f} moved to Cash on Hand.",
+                "fund": FundSerializer(fund).data,
+                "transferred": str(remaining),
+                "profile": _account_profile(account),
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+class FundAllocationSuggestionView(APIView):
+    """Return a 50/30/20 allocation suggestion for the active setup."""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        account = _get_account(request.user)
+        if account is None:
+            return _account_not_found_response()
+
+        setup = MonthlyBudgetSetup.get_active(account)
+        if setup is None:
+            return Response(
+                {"detail": "No budget setup found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        income = setup.estimated_monthly_income
+        funds_total = (
+            Fund.objects.filter(account=account, status=Fund.STATUS_ACTIVE).aggregate(
+                total=Sum("monthly_allocation")
+            )["total"]
+            or Decimal("0.00")
+        )
+        return Response(
+            {
+                "estimated_income": income,
+                "suggestion_50_30_20": {
+                    "needs": round(income * Decimal("0.50"), 2),
+                    "wants": round(income * Decimal("0.30"), 2),
+                    "savings": round(income * Decimal("0.20"), 2),
+                },
+                "current": {
+                    "needs": setup.needs_budget,
+                    "wants": setup.wants_budget,
+                    "funds_total": funds_total,
+                },
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+# ── BUDGET ──
+class MonthlyBudgetSetupListView(APIView):
+    """List budget setup history newest first."""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        account = _get_account(request.user)
+        if account is None:
+            return _account_not_found_response()
+        setups = MonthlyBudgetSetup.objects.filter(account=account).order_by(
+            "-effective_from",
+        )
+        serializer = MonthlyBudgetSetupSerializer(
+            setups,
+            many=True,
+            context={"account": account},
+        )
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+
+class MonthlyBudgetSetupUpdateView(SetupBudgetView):
+    """Create a new budget setup row while preserving history."""
+
+
+# ── INCOME ──
+class IncomeView(APIView):
+    """Create a month cycle and allocate entered income."""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        account = _get_account(request.user)
+        if account is None:
+            return _account_not_found_response()
+
+        income = _parse_decimal(request.data.get("income", "0"), "income")
+        if income < Decimal("0.00"):
             return Response(
                 {"error": "Income cannot be negative."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        profile, _ = FinancialProfile.objects.get_or_create(user=request.user)
+        now = timezone.now()
+        try:
+            year = int(request.data.get("year", now.year))
+            month = int(request.data.get("month", now.month))
+        except (TypeError, ValueError):
+            return Response(
+                {"error": "Year and month must be valid integers."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
-        # Close ALL previous active cycles (each income creates a new cycle)
         MonthCycle.objects.filter(
-            user=request.user,
-            status=MonthCycle.STATUS_ACTIVE
+            account=account,
+            status=MonthCycle.STATUS_ACTIVE,
         ).update(status=MonthCycle.STATUS_CLOSED)
 
-        # Get the last cycle to determine next month/year
-        last_cycle = (
-            MonthCycle.objects
-            .filter(user=request.user)
-            .order_by("-year", "-month")
-            .first()
-        )
+        setup = MonthlyBudgetSetup.get_active(account)
+        if setup is None:
+            return Response(
+                {"error": "No budget setup found. Complete setup first."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
-        if last_cycle:
-            # Increment month, handle year rollover
-            year = last_cycle.year
-            month = last_cycle.month + 1
-            if month > 12:
-                month = 1
-                year += 1
-        else:
-            # First cycle ever - use current date
-            now = timezone.now()
-            year = now.year
-            month = now.month
+        try:
+            cycle = MonthCycle.objects.create(
+                account=account,
+                budget_setup=setup,
+                year=year,
+                month=month,
+                status=MonthCycle.STATUS_ACTIVE,
+            )
+        except Exception as exc:
+            return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Create a NEW cycle with incremented month
-        cycle = MonthCycle.objects.create(
-            user=request.user,
-            year=year,
-            month=month,
-            income=income,
-            status=MonthCycle.STATUS_ACTIVE,
-        )
-
-        # Refresh profile from database to ensure we have the latest values
-        profile.refresh_from_db()
-
-        cycle = run_allocation_engine(profile, cycle, income)
+        cycle = run_income_allocation(account, cycle, income)
+        if cycle.income_scenario == MonthCycle.SCENARIO_ZERO:
+            return Response(
+                {
+                    "cycle": MonthCycleSerializer(cycle).data,
+                    "profile": _account_profile(account),
+                    "survival_mode": True,
+                    "survival_prompt": (
+                        f"No income this month. Use Emergency Fund to cover "
+                        f"₱{cycle.needs_budget_used:,.2f} needs budget?"
+                    ),
+                },
+                status=status.HTTP_200_OK,
+            )
 
         return Response(
             {
-                "cycle":   MonthCycleSerializer(cycle).data,
-                "profile": FinancialProfileSerializer(profile).data,
+                "cycle": MonthCycleSerializer(cycle).data,
+                "profile": _account_profile(account),
+                "survival_mode": False,
             },
             status=status.HTTP_200_OK,
         )
 
 
-# ──────────────────────────────────────────────────────────────────────
-# 7. Invest  →  POST /api/invest/
-# ──────────────────────────────────────────────────────────────────────
-
-class InvestView(APIView):
-    """
-    Move funds from savings → investments_total.
-
-    POST  /api/invest/
-        { "amount": "5000.00" }
-
-    This transfers money from savings to investments_total and updates
-    the investment allocation budget. Does not require an active cycle.
-
-    Success 200:
-        { "profile": { ... } }
-    """
+class SurvivalDrawView(APIView):
+    """Draw from Emergency Fund for the active zero-income cycle."""
 
     permission_classes = [permissions.IsAuthenticated]
 
     def post(self, request):
-        try:
-            amount = Decimal(str(request.data.get("amount", "0")))
-        except Exception:
+        account = _get_account(request.user)
+        if account is None:
+            return _account_not_found_response()
+
+        cycle = (
+            MonthCycle.objects.filter(
+                account=account,
+                status=MonthCycle.STATUS_ACTIVE,
+            )
+            .order_by("-created_at")
+            .first()
+        )
+        if cycle is None or cycle.income_scenario != MonthCycle.SCENARIO_ZERO:
             return Response(
-                {"error": "Invalid amount value."},
+                {"error": "No active zero-income cycle found."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        profile, _ = FinancialProfile.objects.get_or_create(user=request.user)
-
-        # Get or create an active cycle for logging purposes
-        # If no active cycle exists, create a temporary one for this transaction
-        cycle = (
-            MonthCycle.objects
-            .filter(user=request.user, status=MonthCycle.STATUS_ACTIVE)
-            .order_by("-year", "-month")
-            .first()
-        )
-        
-        if cycle is None:
-            # Create a temporary cycle for logging the transfer
-            from django.utils import timezone
-            now = timezone.now()
-            cycle, _ = MonthCycle.objects.get_or_create(
-                user=request.user,
-                year=now.year,
-                month=now.month,
-                defaults={"status": MonthCycle.STATUS_ACTIVE}
-            )
-
         try:
-            profile = run_invest(profile, cycle, amount)
+            transfer = run_survival_draw(account, cycle)
         except ValueError as exc:
             return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
-
-        return Response(
-            {"profile": FinancialProfileSerializer(profile).data},
-            status=status.HTTP_200_OK,
-        )
-
-
-# ──────────────────────────────────────────────────────────────────────
-# 8. Divest  →  POST /api/divest/
-# ──────────────────────────────────────────────────────────────────────
-
-class DivestView(APIView):
-    """
-    Move funds from investments_total → savings (reverse of invest).
-
-    POST  /api/divest/
-        { "amount": "5000.00" }
-
-    This transfers money from investments back to savings and updates
-    the investment allocation budget. Does not require an active cycle.
-
-    Success 200:
-        { "profile": { ... } }
-    """
-
-    permission_classes = [permissions.IsAuthenticated]
-
-    def post(self, request):
-        try:
-            amount = Decimal(str(request.data.get("amount", "0")))
-        except Exception:
-            return Response(
-                {"error": "Invalid amount value."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        profile, _ = FinancialProfile.objects.get_or_create(user=request.user)
-
-        # Get or create an active cycle for logging purposes
-        # If no active cycle exists, create a temporary one for this transaction
-        cycle = (
-            MonthCycle.objects
-            .filter(user=request.user, status=MonthCycle.STATUS_ACTIVE)
-            .order_by("-year", "-month")
-            .first()
-        )
-        
-        if cycle is None:
-            # Create a temporary cycle for logging the transfer
-            from django.utils import timezone
-            now = timezone.now()
-            cycle, _ = MonthCycle.objects.get_or_create(
-                user=request.user,
-                year=now.year,
-                month=now.month,
-                defaults={"status": MonthCycle.STATUS_ACTIVE}
-            )
-
-        try:
-            profile = run_divest(profile, cycle, amount)
-        except ValueError as exc:
-            return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
-
-        return Response(
-            {"profile": FinancialProfileSerializer(profile).data},
-            status=status.HTTP_200_OK,
-        )
-
-
-# ──────────────────────────────────────────────────────────────────────
-# 8. Month Cycle History  →  GET /api/finance/cycles/
-# ──────────────────────────────────────────────────────────────────────
-
-class MonthCycleListView(generics.ListAPIView):
-    """Return all MonthCycles for the authenticated user, newest first."""
-
-    serializer_class   = MonthCycleSerializer
-    permission_classes = [permissions.IsAuthenticated]
-
-    def get_queryset(self):
-        return (
-            MonthCycle.objects
-            .filter(user=self.request.user)
-            .prefetch_related("allocation_logs")
-        )
-
-
-# ──────────────────────────────────────────────────────────────────────
-# 9. Current Active Cycle  →  GET /api/cycle/current/
-# ──────────────────────────────────────────────────────────────────────
-
-class CurrentMonthCycleView(APIView):
-    """
-    Return the most recent active MonthCycle with calculated remaining amounts.
-
-    Returns 404 if no active cycle exists (user has not submitted income yet).
-    
-    Response includes:
-        - All cycle fields from MonthCycleSerializer
-        - needs_remaining: expenses_budget - (total needs expenses)
-        - wants_remaining: wants_budget - (total wants expenses)
-    """
-
-    permission_classes = [permissions.IsAuthenticated]
-
-    def get(self, request):
-        cycle = (
-            MonthCycle.objects
-            .filter(user=request.user, status=MonthCycle.STATUS_ACTIVE)
-            .prefetch_related("allocation_logs")
-            .order_by("-year", "-month")
-            .first()
-        )
-        if cycle is None:
-            return Response(
-                {"detail": "No active cycle. Submit income via POST /api/income/."},
-                status=status.HTTP_404_NOT_FOUND,
-            )
-        
-        # Calculate remaining amounts for each category
-        needs_spent = (
-            Expense.objects
-            .filter(cycle=cycle, category=Expense.CATEGORY_NEEDS)
-            .aggregate(total=models.Sum("amount"))["total"] or Decimal("0.00")
-        )
-        
-        wants_spent = (
-            Expense.objects
-            .filter(cycle=cycle, category=Expense.CATEGORY_WANTS)
-            .aggregate(total=models.Sum("amount"))["total"] or Decimal("0.00")
-        )
-        
-        needs_remaining = cycle.expenses_budget - needs_spent
-        wants_remaining = cycle.wants_budget - wants_spent
-        
-        # Serialize cycle data and add remaining amounts
-        data = MonthCycleSerializer(cycle).data
-        data["needs_remaining"] = needs_remaining
-        data["wants_remaining"] = wants_remaining
-        data["needs_spent"] = needs_spent
-        data["wants_spent"] = wants_spent
-        
-        return Response(data, status=status.HTTP_200_OK)
-
-
-# ──────────────────────────────────────────────────────────────────────
-# 10. Log Expense  →  POST /api/expenses/
-# ──────────────────────────────────────────────────────────────────────
-
-class ExpenseView(APIView):
-    """
-    Log a spending transaction for the current active cycle.
-
-    POST  /api/expenses/
-
-    Request body:
-        {
-            "amount":      "250.00",
-            "category":    "needs",        -- "needs" | "wants"
-            "description": "Groceries",    -- optional
-            "date":        "2026-03-28"    -- optional; defaults to today
-        }
-
-    What happens on success
-    -----------------------
-    1. Expense record is created and linked to the active cycle.
-    2. cash_on_hand is reduced by amount.
-    3. The correct budget bucket is reduced (expenses_budget or wants_budget).
-    4. remaining_budget is reduced.
-    5. AI monitoring engine runs (Steps 16–19).
-    6. Any triggered alerts are returned alongside the expense.
-
-    Success 201:
-        {
-            "expense":  { ... },
-            "profile":  { ... updated buckets ... },
-            "cycle":    { ... updated budgets ... },
-            "alerts":   [ ... any new alerts ... ]
-        }
-    """
-
-    permission_classes = [permissions.IsAuthenticated]
-
-    def post(self, request):
-        profile, _ = FinancialProfile.objects.get_or_create(user=request.user)
-
-        # Validate incoming data
-        serializer = ExpenseSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-
-        amount   = serializer.validated_data["amount"]
-        category = serializer.validated_data["category"]
-
-        # Guard: cannot spend more than what's in cash_on_hand
-        if amount > profile.cash_on_hand:
-            return Response(
-                {
-                    "error": (
-                        f"Insufficient cash on hand. "
-                        f"Available: ₱{profile.cash_on_hand:,.2f}, "
-                        f"requested: ₱{amount:,.2f}."
-                    )
-                },
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        # Resolve active cycle
-        # If no active cycle exists, create one for tracking expenses
-        cycle = (
-            MonthCycle.objects
-            .filter(user=request.user, status=MonthCycle.STATUS_ACTIVE)
-            .order_by("-year", "-month")
-            .first()
-        )
-        
-        if cycle is None:
-            # Create a temporary cycle for tracking expenses from cash_on_hand
-            # This allows users to track expenses before their first income
-            from django.utils import timezone
-            now = timezone.now()
-            cycle, _ = MonthCycle.objects.get_or_create(
-                user=request.user,
-                year=now.year,
-                month=now.month,
-                defaults={
-                    "status": MonthCycle.STATUS_ACTIVE,
-                    "income": Decimal("0.00"),
-                    "expenses_budget": Decimal("0.00"),
-                    "wants_budget": Decimal("0.00"),
-                    "remaining_budget": Decimal("0.00"),
-                }
-            )
-
-        # Resolve expense date (default to today)
-        expense_date = serializer.validated_data.get("date") or timezone.localdate()
-
-        # Persist the expense record
-        expense = Expense.objects.create(
-            user        = request.user,
-            cycle       = cycle,
-            amount      = amount,
-            category    = category,
-            description = serializer.validated_data.get("description", ""),
-            date        = expense_date,
-        )
-
-        # Run deduction + monitoring engine
-        new_alerts = run_expense(profile, cycle, expense)
-
-        # Re-read from DB to return fully persisted state
-        profile.refresh_from_db()
-        cycle.refresh_from_db()
 
         return Response(
             {
-                "expense": ExpenseSerializer(expense).data,
-                "profile": FinancialProfileSerializer(profile).data,
-                "cycle":   MonthCycleSerializer(cycle).data,
-                "alerts":  AlertSerializer(new_alerts, many=True).data,
+                "message": f"₱{transfer.amount:,.2f} moved from Emergency Fund to Cash on Hand.",
+                "transfer": TransferSerializer(transfer).data,
+                "profile": _account_profile(account),
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+# ── TRANSFERS ──
+class TransferCreateView(APIView):
+    """Create a transfer using the service transfer engine."""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        account = _get_account(request.user)
+        if account is None:
+            return _account_not_found_response()
+
+        serializer = TransferCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        from_fund = serializer.validated_data.get("from_fund")
+        to_fund = serializer.validated_data.get("to_fund")
+
+        if from_fund and from_fund.account_id != account.id:
+            return Response(
+                {"error": "Source fund not found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        if to_fund is None or to_fund.account_id != account.id:
+            return Response(
+                {"error": "Destination fund not found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        cycle = MonthCycle.objects.filter(
+            account=account,
+            status=MonthCycle.STATUS_ACTIVE,
+        ).first()
+
+        try:
+            transfer = run_transfer(
+                account=account,
+                cycle=cycle,
+                from_fund=from_fund,
+                to_fund=to_fund,
+                amount=serializer.validated_data["amount"],
+                transfer_type=serializer.validated_data["transfer_type"],
+                note=serializer.validated_data.get("note", ""),
+                transfer_date=serializer.validated_data.get("date"),
+            )
+        except ValueError as exc:
+            return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response(
+            {
+                "transfer": TransferSerializer(transfer).data,
+                "profile": _account_profile(account),
             },
             status=status.HTTP_201_CREATED,
         )
 
 
-# ──────────────────────────────────────────────────────────────────────
-# 11. Daily Limit  →  GET /api/expenses/daily-limit/
-# ──────────────────────────────────────────────────────────────────────
-
-class DailyLimitView(APIView):
-    """
-    Return the computed daily spending limit for the current active cycle.
-
-    GET  /api/expenses/daily-limit/
-
-    Formula:
-        total_days_in_month = days in current month (28-31)
-        daily_limit = remaining_budget / total_days_in_month
-        
-    This provides a flexible daily guideline rather than strict enforcement.
-    Users can spend more on some days (groceries, bills) and less on others.
-    The daily_limit adjusts as remaining_budget decreases.
-
-    Success 200:
-        {
-            "daily_limit":     "333.33",
-            "remaining_budget":"5000.00",
-            "total_days":      30,
-            "days_passed":     15,
-            "today_spent":     "450.00"
-        }
-
-    404 if no active cycle exists.
-    """
+class TransferListView(APIView):
+    """List transfers with optional fund, type, and limit filters."""
 
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request):
-        cycle = (
-            MonthCycle.objects
-            .filter(user=request.user, status=MonthCycle.STATUS_ACTIVE)
-            .order_by("-year", "-month")
-            .first()
-        )
-        if cycle is None:
-            return Response(
-                {"detail": "No active cycle. Submit income via POST /api/income/."},
-                status=status.HTTP_404_NOT_FOUND,
+        account = _get_account(request.user)
+        if account is None:
+            return _account_not_found_response()
+
+        qs = Transfer.objects.filter(account=account).order_by("-date", "-created_at")
+        fund_id = request.query_params.get("fund")
+        if fund_id:
+            qs = qs.filter(
+                django_models.Q(from_fund_id=fund_id)
+                | django_models.Q(to_fund_id=fund_id)
             )
 
-        today          = timezone.localdate()
-        total_days     = calendar.monthrange(today.year, today.month)[1]
-        days_passed    = today.day
-        
-        # Daily limit based on total days in month (flexible guideline)
-        daily_limit    = cycle.remaining_budget / Decimal(total_days) if total_days > 0 else Decimal("0.00")
+        transfer_type = request.query_params.get("type")
+        if transfer_type:
+            qs = qs.filter(transfer_type=transfer_type)
 
-        # Total spent today
-        today_spent = (
-            Expense.objects
-            .filter(cycle=cycle, date=today)
-            .values_list("amount", flat=True)
-        )
-        today_spent = sum(today_spent, Decimal("0.00"))
+        try:
+            limit = min(int(request.query_params.get("limit", 50)), 200)
+        except (TypeError, ValueError):
+            limit = 50
 
         return Response(
-            {
-                "daily_limit":      round(daily_limit, 2),
-                "remaining_budget": cycle.remaining_budget,
-                "total_days":       total_days,
-                "days_passed":      days_passed,
-                "today_spent":      today_spent,
-            },
+            TransferSerializer(qs[:limit], many=True).data,
             status=status.HTTP_200_OK,
         )
 
 
-# ──────────────────────────────────────────────────────────────────────
-# 12. List Expenses  →  GET /api/expenses/
-# ──────────────────────────────────────────────────────────────────────
+class AddMoneyView(APIView):
+    """Add external money directly to Cash on Hand."""
 
-class ExpenseListView(generics.ListAPIView):
-    """
-    Return all expenses for the authenticated user's active cycle, newest first.
-
-    GET  /api/expenses/
-
-    Optional query params:
-        ?cycle=<id>     filter by a specific cycle id
-        ?category=needs filter by category
-    """
-
-    serializer_class   = ExpenseSerializer
     permission_classes = [permissions.IsAuthenticated]
 
-    def get_queryset(self):
-        qs = Expense.objects.filter(user=self.request.user)
+    def post(self, request):
+        account = _get_account(request.user)
+        if account is None:
+            return _account_not_found_response()
 
-        cycle_id = self.request.query_params.get("cycle")
+        amount = _parse_decimal(request.data.get("amount", "0"))
+        note = request.data.get("note", "").strip()
+        if not note:
+            return Response(
+                {"error": "A note is required when adding external money."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        cash_on_hand = _get_system_fund_or_404(account, Fund.SYSTEM_CASH_ON_HAND)
+        if cash_on_hand is None:
+            return Response(
+                {"detail": "Cash on Hand fund not found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        cycle = MonthCycle.objects.filter(
+            account=account,
+            status=MonthCycle.STATUS_ACTIVE,
+        ).first()
+        parsed_date = _parse_iso_date(request.data.get("date"))
+
+        try:
+            transfer = run_transfer(
+                account=account,
+                cycle=cycle,
+                from_fund=None,
+                to_fund=cash_on_hand,
+                amount=amount,
+                transfer_type=Transfer.TYPE_EXTERNAL_ADD,
+                note=note,
+                transfer_date=parsed_date,
+            )
+        except ValueError as exc:
+            return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response(
+            {
+                "transfer": TransferSerializer(transfer).data,
+                "profile": _account_profile(account),
+            },
+            status=status.HTTP_201_CREATED,
+        )
+
+
+# ── EXPENSES ──
+class ExpenseCreateView(APIView):
+    """Create an expense and deduct it from Cash on Hand."""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        account = _get_account(request.user)
+        if account is None:
+            return _account_not_found_response()
+
+        cycle = MonthCycle.objects.filter(
+            account=account,
+            status=MonthCycle.STATUS_ACTIVE,
+        ).first()
+        if cycle is None:
+            return Response(
+                {"error": "No active cycle. Submit income first."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        serializer = ExpenseSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        expense_date = serializer.validated_data.get("date") or timezone.localdate()
+        expense_data = {
+            key: value
+            for key, value in serializer.validated_data.items()
+            if key != "date"
+        }
+
+        expense = Expense.objects.create(
+            account=account,
+            cycle=cycle,
+            date=expense_date,
+            **expense_data,
+        )
+
+        try:
+            new_alerts = run_expense(account, cycle, expense)
+        except ValueError as exc:
+            expense.delete()
+            return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        cycle.refresh_from_db()
+        return Response(
+            {
+                "expense": ExpenseSerializer(expense).data,
+                "cycle": MonthCycleSerializer(cycle).data,
+                "profile": _account_profile(account),
+                "alerts": AlertSerializer(new_alerts, many=True).data,
+            },
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class ExpenseListView(APIView):
+    """List expenses, defaulting to the active cycle."""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        account = _get_account(request.user)
+        if account is None:
+            return _account_not_found_response()
+
+        qs = Expense.objects.filter(account=account).order_by("-date", "-created_at")
+        cycle_id = request.query_params.get("cycle")
         if cycle_id:
             qs = qs.filter(cycle_id=cycle_id)
         else:
-            # Default: active cycle only
-            active_cycle = (
-                MonthCycle.objects
-                .filter(user=self.request.user, status=MonthCycle.STATUS_ACTIVE)
-                .order_by("-year", "-month")
-                .first()
-            )
-            if active_cycle:
-                qs = qs.filter(cycle=active_cycle)
-            else:
-                qs = qs.none()
+            active_cycle = MonthCycle.objects.filter(
+                account=account,
+                status=MonthCycle.STATUS_ACTIVE,
+            ).first()
+            qs = qs.filter(cycle=active_cycle) if active_cycle else qs.none()
 
-        category = self.request.query_params.get("category")
+        category = request.query_params.get("category")
         if category:
             qs = qs.filter(category=category)
 
-        return qs
-
-
-# ──────────────────────────────────────────────────────────────────────
-# 13. Alerts  →  GET /api/alerts/
-# ──────────────────────────────────────────────────────────────────────
-
-class AlertListView(generics.ListAPIView):
-    """
-    Return unread alerts for the authenticated user, newest first.
-
-    GET  /api/alerts/
-
-    To include read alerts, pass ?all=true.
-
-    Success 200:
-        [ { "id", "type", "message", "is_read", "created_at" }, ... ]
-    """
-
-    serializer_class   = AlertSerializer
-    permission_classes = [permissions.IsAuthenticated]
-
-    def get_queryset(self):
-        qs = Alert.objects.filter(user=self.request.user)
-        if self.request.query_params.get("all") != "true":
-            qs = qs.filter(is_read=False)
-        return qs
-
-
-# ──────────────────────────────────────────────────────────────────────
-# 14. Mark Alert Read  →  PATCH /api/alerts/<id>/read/
-# ──────────────────────────────────────────────────────────────────────
-
-class AlertMarkReadView(APIView):
-    """
-    Mark a single alert as read.
-
-    PATCH  /api/alerts/<id>/read/
-
-    Success 200:
-        { "id": 1, "is_read": true, ... }
-
-    404 if the alert does not belong to the authenticated user.
-    """
-
-    permission_classes = [permissions.IsAuthenticated]
-
-    def patch(self, request, pk: int):
         try:
-            alert = Alert.objects.get(pk=pk, user=request.user)
-        except Alert.DoesNotExist:
-            return Response(
-                {"detail": "Alert not found."},
-                status=status.HTTP_404_NOT_FOUND,
-            )
-        alert.is_read = True
-        alert.save(update_fields=["is_read"])
-        return Response(AlertSerializer(alert).data, status=status.HTTP_200_OK)
+            limit = min(int(request.query_params.get("limit", 100)), 500)
+        except (TypeError, ValueError):
+            limit = 100
 
-
-
-# ──────────────────────────────────────────────────────────────────────
-# 15. Reset Expenses  →  POST /api/cycle/current/reset-expenses/
-# ──────────────────────────────────────────────────────────────────────
-
-class ResetExpensesView(APIView):
-    """
-    Delete all expenses from the current active cycle and restore budgets.
-    
-    POST  /api/cycle/current/reset-expenses/
-    
-    This will:
-    - Delete all expenses from the current cycle
-    - Restore remaining_budget to full amount (expenses_budget + wants_budget)
-    - Restore cash_on_hand by adding back all spent amounts
-    - Recalculate net worth snapshot
-    
-    Success 200:
-        {
-            "message": "Expenses reset successfully",
-            "deleted_count": 6,
-            "cycle": { ... },
-            "profile": { ... }
-        }
-    
-    404 if no active cycle exists.
-    """
-    
-    permission_classes = [permissions.IsAuthenticated]
-    
-    def post(self, request):
-        # Get active cycle
-        cycle = (
-            MonthCycle.objects
-            .filter(user=request.user, status=MonthCycle.STATUS_ACTIVE)
-            .order_by("-year", "-month")
-            .first()
-        )
-        
-        if cycle is None:
-            return Response(
-                {"error": "No active cycle. Submit income via POST /api/income/ first."},
-                status=status.HTTP_404_NOT_FOUND,
-            )
-        
-        profile, _ = FinancialProfile.objects.get_or_create(user=request.user)
-        
-        # Calculate total spent in this cycle
-        expenses = Expense.objects.filter(cycle=cycle)
-        total_spent = sum(expense.amount for expense in expenses)
-        expense_count = expenses.count()
-        
-        # Delete all expenses
-        expenses.delete()
-        
-        # Restore remaining_budget to full amount
-        cycle.remaining_budget = cycle.expenses_budget + cycle.wants_budget
-        cycle.save()
-        
-        # Restore cash_on_hand
-        profile.cash_on_hand += total_spent
-        profile.save()
-        
-        # Capture updated net worth
-        NetWorthSnapshot.capture(profile)
-        
         return Response(
-            {
-                "message": "Expenses reset successfully",
-                "deleted_count": expense_count,
-                "total_restored": total_spent,
-                "cycle": MonthCycleSerializer(cycle).data,
-                "profile": FinancialProfileSerializer(profile).data,
-            },
+            ExpenseSerializer(qs[:limit], many=True).data,
             status=status.HTTP_200_OK,
         )
 
 
+class DailyLimitView(APIView):
+    """Return today's spending and suggested daily limit."""
 
-# ──────────────────────────────────────────────────────────────────────
-# 16. Investments CRUD  →  /api/investments/
-# ──────────────────────────────────────────────────────────────────────
-
-class InvestmentListCreateView(generics.ListCreateAPIView):
-    """
-    List all investments or create a new investment.
-    
-    GET  /api/investments/
-    POST /api/investments/
-    
-    Request body (POST):
-        {
-            "name": "BDO Stock",
-            "type": "stocks",
-            "total_invested": "10000.00",
-            "current_value": "12000.00"
-        }
-    
-    When creating an investment, validates that total_invested doesn't exceed
-    the allocated investment budget. The FinancialProfile.investments_total
-    is automatically synced with the sum of all investments.
-    
-    Validation:
-        - Sum of all Investment.total_invested must not exceed InvestmentAllocation.total_allocated
-        - If user wants to add more investments, they must transfer funds from savings first
-    """
-    
-    serializer_class = InvestmentSerializer
     permission_classes = [permissions.IsAuthenticated]
-    
-    def get_queryset(self):
-        return Investment.objects.filter(user=self.request.user)
-    
-    def create(self, request, *args, **kwargs):
-        """Override create to add validation before saving."""
-        serializer = self.get_serializer(data=request.data)
-        
-        if not serializer.is_valid():
+
+    def get(self, request):
+        account = _get_account(request.user)
+        if account is None:
+            return _account_not_found_response()
+
+        cycle = MonthCycle.objects.filter(
+            account=account,
+            status=MonthCycle.STATUS_ACTIVE,
+        ).first()
+        if cycle is None:
             return Response(
-                {
-                    "error": "Validation failed",
-                    "details": serializer.errors
-                },
+                {"error": "No active cycle. Submit income first."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        
-        self.perform_create(serializer)
-        headers = self.get_success_headers(serializer.data)
-        return Response(serializer.data, status=status.HTTP_201_CREATED, headers=headers)
-    
-    def perform_create(self, serializer):
-        investment = serializer.save(user=self.request.user)
-        
-        # Sync investments_total in FinancialProfile
-        profile, _ = FinancialProfile.objects.get_or_create(user=self.request.user)
-        profile.sync_investments_total()
-        
-        # Capture net worth snapshot
-        NetWorthSnapshot.capture(profile)
+
+        today = timezone.localdate()
+        _, total_days = calendar.monthrange(today.year, today.month)
+        remaining_days = max(1, total_days - today.day)
+        daily_limit = cycle.remaining_budget / Decimal(remaining_days)
+        today_spent = (
+            Expense.objects.filter(cycle=cycle, date=today).aggregate(
+                total=Sum("amount")
+            )["total"]
+            or Decimal("0.00")
+        )
+
+        return Response(
+            {
+                "daily_limit": daily_limit,
+                "remaining_budget": cycle.remaining_budget,
+                "remaining_days": remaining_days,
+                "today_spent": today_spent,
+            },
+            status=status.HTTP_200_OK,
+        )
 
 
-class InvestmentDetailView(generics.RetrieveUpdateDestroyAPIView):
-    """
-    Retrieve, update, or delete a specific investment.
-    
-    GET    /api/investments/<id>/
-    PUT    /api/investments/<id>/
-    PATCH  /api/investments/<id>/
-    DELETE /api/investments/<id>/
-    
-    When updating or deleting, the FinancialProfile.investments_total
-    is automatically synced.
-    """
-    
-    serializer_class = InvestmentSerializer
+# ── ALERTS ──
+class AlertListView(APIView):
+    """List unread alerts by default, or all alerts with all=true."""
+
     permission_classes = [permissions.IsAuthenticated]
-    
-    def get_queryset(self):
-        return Investment.objects.filter(user=self.request.user)
-    
-    def perform_update(self, serializer):
-        serializer.save()
-        
-        # Sync investments_total in FinancialProfile
-        profile, _ = FinancialProfile.objects.get_or_create(user=self.request.user)
-        profile.sync_investments_total()
-        
-        # Capture net worth snapshot
-        NetWorthSnapshot.capture(profile)
-    
-    def perform_destroy(self, instance):
-        user = instance.user
-        instance.delete()
-        
-        # Sync investments_total in FinancialProfile
-        profile, _ = FinancialProfile.objects.get_or_create(user=user)
-        profile.sync_investments_total()
-        
-        # Capture net worth snapshot
-        NetWorthSnapshot.capture(profile)
+
+    def get(self, request):
+        account = _get_account(request.user)
+        if account is None:
+            return _account_not_found_response()
+
+        qs = Alert.objects.filter(account=account).order_by("-created_at")
+        if request.query_params.get("all") != "true":
+            qs = qs.filter(is_read=False)
+        return Response(AlertSerializer(qs, many=True).data, status=status.HTTP_200_OK)
 
 
-# ──────────────────────────────────────────────────────────────────────
-# 17. Close Month  →  POST /api/month/close/
-# ──────────────────────────────────────────────────────────────────────
+class AlertMarkReadView(APIView):
+    """Mark one alert as read."""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def patch(self, request, pk):
+        account = _get_account(request.user)
+        if account is None:
+            return _account_not_found_response()
+
+        try:
+            alert = Alert.objects.get(pk=pk, account=account)
+        except Alert.DoesNotExist:
+            return Response({"detail": "Alert not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        alert.is_read = True
+        alert.save(update_fields=["is_read"])
+        return Response(
+            {
+                "alert": AlertSerializer(alert).data,
+                "profile": _account_profile(account),
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+# ── SNAPSHOTS AND SUMMARY ──
+class NetWorthSnapshotListView(APIView):
+    """List recent net worth snapshots."""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        account = _get_account(request.user)
+        if account is None:
+            return _account_not_found_response()
+
+        try:
+            limit = min(int(request.query_params.get("limit", 30)), 200)
+        except (TypeError, ValueError):
+            limit = 30
+
+        qs = NetWorthSnapshot.objects.filter(account=account).order_by("-captured_at")
+        return Response(
+            NetWorthSnapshotSerializer(qs[:limit], many=True).data,
+            status=status.HTTP_200_OK,
+        )
+
 
 class CloseMonthView(APIView):
-    """
-    End-of-month engine: close current cycle and create summary.
-    
-    POST  /api/month/close/
-    
-    Steps 22-25:
-        22. Create MonthSummary from current cycle
-        23. Move remaining_budget to cash_on_hand (already there)
-        24. Move excess cash to savings (optional)
-        25. Close cycle (status='closed')
-        26. Recalculate net worth snapshot
-    
-    Success 200:
-        {
-            "message": "Month closed successfully",
-            "summary": { ... },
-            "profile": { ... }
-        }
-    """
-    
+    """Close the active month and return its summary."""
+
     permission_classes = [permissions.IsAuthenticated]
-    
+
     def post(self, request):
-        # Get active cycle
-        cycle = (
-            MonthCycle.objects
-            .filter(user=request.user, status=MonthCycle.STATUS_ACTIVE)
-            .order_by("-year", "-month")
-            .first()
-        )
-        
+        account = _get_account(request.user)
+        if account is None:
+            return _account_not_found_response()
+
+        cycle = MonthCycle.objects.filter(
+            account=account,
+            status=MonthCycle.STATUS_ACTIVE,
+        ).first()
         if cycle is None:
             return Response(
-                {"error": "No active cycle to close."},
+                {"detail": "No active cycle to close."},
                 status=status.HTTP_404_NOT_FOUND,
             )
-        
-        profile, _ = FinancialProfile.objects.get_or_create(user=request.user)
-        
-        # Step 22 — Create MonthSummary
-        summary = MonthSummary.create_from_cycle(cycle)
-        
-        # Step 23 — Remaining budget is already in cash_on_hand
-        # (no action needed, it's already there)
-        
-        # Step 24 — Optional: Move excess cash to savings
-        # Get user preference for auto-save threshold (default: keep all in cash)
-        auto_save_threshold = request.data.get("auto_save_threshold")
-        if auto_save_threshold:
-            try:
-                threshold = Decimal(str(auto_save_threshold))
-                if profile.cash_on_hand > threshold:
-                    excess = profile.cash_on_hand - threshold
-                    profile.cash_on_hand -= excess
-                    profile.savings += excess
-                    profile.save()
-            except (ValueError, TypeError):
-                pass  # Invalid threshold, skip auto-save
-        
-        # Step 25 — Close the cycle
-        cycle.status = MonthCycle.STATUS_CLOSED
-        cycle.save()
-        
-        # Step 26 — Recalculate net worth snapshot
-        NetWorthSnapshot.capture(profile)
-        
+
+        try:
+            summary = run_close_month(account, cycle)
+        except Exception as exc:
+            return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
         return Response(
             {
-                "message": "Month closed successfully",
+                "message": "Month closed successfully.",
                 "summary": MonthSummarySerializer(summary).data,
-                "profile": FinancialProfileSerializer(profile).data,
+                "profile": _account_profile(account),
             },
             status=status.HTTP_200_OK,
         )
-
-
-# ──────────────────────────────────────────────────────────────────────
-# 18. Reports  →  GET /api/reports/
-# ──────────────────────────────────────────────────────────────────────
-
-class ReportsView(APIView):
-    """
-    Financial reports with time range filtering and monthly breakdowns.
-    
-    GET  /api/reports/
-    
-    Query params:
-        - time_range: '1m' (month), '6m' (6 months), '1y' (1 year), 'all' (all time)
-                      defaults to '6m'
-    
-    Success 200:
-        {
-            "summary": {
-                "total_income": "50000.00",
-                "total_expenses": "15000.00",
-                "total_savings": "35000.00",
-                "savings_rate": "70.0"
-            },
-            "income_vs_expenses": [
-                {"month": "Apr 2026", "income": 50000, "expenses": 15000},
-                ...
-            ],
-            "savings_trend": [
-                {"month": "Apr 2026", "savings": 35000, "cumulative": 35000},
-                ...
-            ],
-            "net_worth_history": [
-                {"month": "Apr 2026", "net_worth": 500000},
-                ...
-            ]
-        }
-    """
-    
-    permission_classes = [permissions.IsAuthenticated]
-    
-    def get(self, request):
-        from datetime import datetime, timedelta
-        from django.db.models import Sum, Q
-        
-        user = request.user
-        time_range = request.query_params.get('time_range', '6m')
-        
-        # Calculate date range
-        today = datetime.now().date()
-        if time_range == '1m':
-            # Current month only
-            start_date = today.replace(day=1)
-        elif time_range == '6m':
-            start_date = today - timedelta(days=180)
-        elif time_range == '1y':
-            start_date = today - timedelta(days=365)
-        else:  # 'all'
-            start_date = None
-        
-        # Try to get data from MonthSummary first (if months have been closed)
-        summaries_qs = MonthSummary.objects.filter(user=user)
-        
-        if start_date:
-            summaries_qs = summaries_qs.filter(cycle__created_at__date__gte=start_date)
-        
-        summaries = list(summaries_qs.order_by('cycle__year', 'cycle__month'))
-        
-        # If no MonthSummary records, build from MonthCycle and Expense data
-        if not summaries:
-            return self._get_reports_from_cycles(user, start_date)
-        
-        # Calculate totals from MonthSummary
-        total_income = sum(s.total_income for s in summaries) if summaries else Decimal("0.00")
-        total_expenses = sum(s.total_expenses for s in summaries) if summaries else Decimal("0.00")
-        total_savings = total_income - total_expenses
-        savings_rate = (total_savings / total_income * 100) if total_income > Decimal("0.00") else Decimal("0.00")
-        
-        # Build monthly breakdown
-        income_vs_expenses = []
-        savings_trend = []
-        net_worth_history = []
-        cumulative_savings = Decimal("0.00")
-        
-        for summary in summaries:
-            month_str = f"{calendar.month_abbr[summary.cycle.month]} {summary.cycle.year}"
-            
-            # Income vs Expenses
-            income_vs_expenses.append({
-                "month": month_str,
-                "income": float(summary.total_income),
-                "expenses": float(summary.total_expenses),
-            })
-            
-            # Savings Trend
-            monthly_savings = summary.total_income - summary.total_expenses
-            cumulative_savings += monthly_savings
-            savings_trend.append({
-                "month": month_str,
-                "savings": float(monthly_savings),
-                "cumulative": float(cumulative_savings),
-            })
-            
-            # Net Worth History
-            net_worth_history.append({
-                "month": month_str,
-                "net_worth": float(summary.net_worth_end),
-            })
-        
-        return Response(
-            {
-                "summary": {
-                    "total_income": float(total_income),
-                    "total_expenses": float(total_expenses),
-                    "total_savings": float(total_savings),
-                    "savings_rate": float(savings_rate),
-                },
-                "income_vs_expenses": income_vs_expenses,
-                "savings_trend": savings_trend,
-                "net_worth_history": net_worth_history,
-            },
-            status=status.HTTP_200_OK,
-        )
-    
-    def _get_reports_from_cycles(self, user, start_date):
-        """
-        Build reports from MonthCycle and Expense data when MonthSummary is not available.
-        This allows reports to work even before months are closed.
-        """
-        from django.db.models import Sum, Q
-        
-        # Get all cycles for this user
-        cycles_qs = MonthCycle.objects.filter(user=user)
-        
-        if start_date:
-            cycles_qs = cycles_qs.filter(created_at__date__gte=start_date)
-        
-        cycles = list(cycles_qs.order_by('year', 'month'))
-        
-        if not cycles:
-            # No data at all
-            return Response(
-                {
-                    "summary": {
-                        "total_income": 0,
-                        "total_expenses": 0,
-                        "total_savings": 0,
-                        "savings_rate": 0,
-                    },
-                    "income_vs_expenses": [],
-                    "savings_trend": [],
-                    "net_worth_history": [],
-                },
-                status=status.HTTP_200_OK,
-            )
-        
-        # Build data by cycle
-        income_vs_expenses = []
-        savings_trend = []
-        net_worth_history = []
-        
-        total_income = Decimal("0.00")
-        total_expenses = Decimal("0.00")
-        cumulative_savings = Decimal("0.00")
-        
-        for cycle in cycles:
-            month_str = f"{calendar.month_abbr[cycle.month]} {cycle.year}"
-            
-            # Get expenses for this cycle
-            cycle_expenses = (
-                Expense.objects
-                .filter(cycle=cycle)
-                .aggregate(total=Sum('amount'))['total'] or Decimal("0.00")
-            )
-            
-            cycle_income = cycle.income
-            cycle_savings = cycle_income - cycle_expenses
-            
-            total_income += cycle_income
-            total_expenses += cycle_expenses
-            cumulative_savings += cycle_savings
-            
-            # Income vs Expenses
-            income_vs_expenses.append({
-                "month": month_str,
-                "income": float(cycle_income),
-                "expenses": float(cycle_expenses),
-            })
-            
-            # Savings Trend
-            savings_trend.append({
-                "month": month_str,
-                "savings": float(cycle_savings),
-                "cumulative": float(cumulative_savings),
-            })
-            
-            # Net Worth History - get latest snapshot for this cycle
-            latest_snapshot = (
-                NetWorthSnapshot.objects
-                .filter(user=user, captured_at__gte=cycle.created_at)
-                .order_by('-captured_at')
-                .first()
-            )
-            
-            net_worth_value = latest_snapshot.net_worth if latest_snapshot else Decimal("0.00")
-            net_worth_history.append({
-                "month": month_str,
-                "net_worth": float(net_worth_value),
-            })
-        
-        total_savings = total_income - total_expenses
-        savings_rate = (total_savings / total_income * 100) if total_income > Decimal("0.00") else Decimal("0.00")
-        
-        return Response(
-            {
-                "summary": {
-                    "total_income": float(total_income),
-                    "total_expenses": float(total_expenses),
-                    "total_savings": float(total_savings),
-                    "savings_rate": float(savings_rate),
-                },
-                "income_vs_expenses": income_vs_expenses,
-                "savings_trend": savings_trend,
-                "net_worth_history": net_worth_history,
-            },
-            status=status.HTTP_200_OK,
-        )
-
-
-
-# ──────────────────────────────────────────────────────────────────────
-# 19. Investment Allocation  →  GET/PATCH /api/investments/allocation/
-# ──────────────────────────────────────────────────────────────────────
-
-class InvestmentAllocationView(APIView):
-    """
-    Get or update the user's investment allocation summary.
-    
-    GET  /api/investments/allocation/
-        Returns the total allocated, current value, and profit/loss
-    
-    PATCH /api/investments/allocation/
-        Update total_allocated (when user transfers savings → investments)
-        {
-            "total_allocated": "120000.00"
-        }
-    
-    The allocation tracks how investments_total is split across individual investments.
-    """
-    
-    permission_classes = [permissions.IsAuthenticated]
-    
-    def get(self, request):
-        allocation, created = InvestmentAllocation.objects.get_or_create(
-            user=request.user
-        )
-        
-        # Sync from current investments
-        allocation.sync_from_investments()
-        
-        return Response(
-            InvestmentAllocationSerializer(allocation).data,
-            status=status.HTTP_200_OK,
-        )
-    
-    def patch(self, request):
-        allocation, created = InvestmentAllocation.objects.get_or_create(
-            user=request.user
-        )
-        
-        # Update total_allocated if provided
-        if "total_allocated" in request.data:
-            try:
-                new_allocated = Decimal(str(request.data["total_allocated"]))
-                if new_allocated < Decimal("0.00"):
-                    return Response(
-                        {"error": "Total allocated cannot be negative."},
-                        status=status.HTTP_400_BAD_REQUEST,
-                    )
-                allocation.total_allocated = new_allocated
-                allocation.save(update_fields=["total_allocated", "updated_at"])
-            except (ValueError, TypeError):
-                return Response(
-                    {"error": "Invalid total_allocated value."},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-        
-        # Sync from current investments
-        allocation.sync_from_investments()
-        
-        # Validate allocation
-        is_valid, message = allocation.validate_allocation()
-        
-        return Response(
-            {
-                "allocation": InvestmentAllocationSerializer(allocation).data,
-                "validation": {
-                    "is_valid": is_valid,
-                    "message": message,
-                }
-            },
-            status=status.HTTP_200_OK,
-        )
-
-
-# ──────────────────────────────────────────────────────────────────────
-# 20. User Profile  →  PATCH /api/auth/profile/
-# ──────────────────────────────────────────────────────────────────────
-
-class UserProfileView(APIView):
-    """
-    Update user profile information (first_name, last_name, email).
-    
-    PATCH /api/auth/profile/
-    
-    Request body:
-        {
-            "first_name": "John",
-            "last_name": "Doe",
-            "email": "john@example.com"
-        }
-    
-    Success 200:
-        {
-            "id": 1,
-            "username": "johndoe",
-            "first_name": "John",
-            "last_name": "Doe",
-            "email": "john@example.com",
-            "date_joined": "2026-01-15T10:30:00Z"
-        }
-    """
-    
-    permission_classes = [permissions.IsAuthenticated]
-    
-    def patch(self, request):
-        """Update user profile."""
-        user = request.user
-        serializer = UserProfileSerializer(user, data=request.data, partial=True)
-        
-        if serializer.is_valid():
-            serializer.save()
-            return Response(serializer.data, status=status.HTTP_200_OK)
-        
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-
-
-# ──────────────────────────────────────────────────────────────────────
-# 21. Change Password  →  POST /api/auth/change-password/
-# ──────────────────────────────────────────────────────────────────────
-
-class ChangePasswordView(APIView):
-    """
-    Change user password with old password verification.
-    
-    POST /api/auth/change-password/
-    
-    Request body:
-        {
-            "old_password": "currentPassword123",
-            "new_password": "newPassword456",
-            "confirm_password": "newPassword456"
-        }
-    
-    Success 200:
-        {
-            "detail": "Password changed successfully"
-        }
-    """
-    
-    permission_classes = [permissions.IsAuthenticated]
-    
-    def post(self, request):
-        """Change password."""
-        serializer = ChangePasswordSerializer(
-            data=request.data,
-            context={'request': request}
-        )
-        
-        if serializer.is_valid():
-            user = request.user
-            user.set_password(serializer.validated_data['new_password'])
-            user.save()
-            
-            return Response(
-                {'detail': 'Password changed successfully'},
-                status=status.HTTP_200_OK
-            )
-        
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
