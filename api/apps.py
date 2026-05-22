@@ -8,4 +8,4 @@ class ApiConfig(AppConfig):
     name = "api"
 
     def ready(self) -> None:
-        import api.signals  # noqa: F401 — registers signal handlers
+        import api.signals  # noqa: F401 — registers all signal handlers

@@ -42,24 +42,29 @@ class FinancialAccount(models.Model):
     def emergency_fund(self) -> "Fund | None":
         return self.funds.filter(name=Fund.SYSTEM_EMERGENCY_FUND).first()
 
-    @classmethod
-    def create_default_funds(cls, account: "FinancialAccount") -> list["Fund"]:
+    def create_default_funds(self) -> list["Fund"]:
         defaults = [
             {
                 "name": Fund.SYSTEM_EMERGENCY_FUND,
                 "type": Fund.TYPE_SYSTEM,
+                "icon": "shield",
+                "color": "#3B6D11",
                 "allocation_priority": 1,
                 "skip_on_low_income": False,
             },
             {
                 "name": Fund.SYSTEM_SAVINGS,
                 "type": Fund.TYPE_SYSTEM,
+                "icon": "piggy-bank",
+                "color": "#185FA5",
                 "allocation_priority": 2,
                 "skip_on_low_income": False,
             },
             {
                 "name": Fund.SYSTEM_CASH_ON_HAND,
                 "type": Fund.TYPE_SYSTEM,
+                "icon": "wallet",
+                "color": "#854F0B",
                 "allocation_priority": 3,
                 "skip_on_low_income": False,
             },
@@ -67,7 +72,7 @@ class FinancialAccount(models.Model):
         funds = []
         for data in defaults:
             fund, _ = Fund.objects.get_or_create(
-                account=account,
+                account=self,
                 name=data["name"],
                 defaults=data,
             )
@@ -182,7 +187,6 @@ class Fund(models.Model):
         return (self.current_balance / self.target_amount) * Decimal("100.00")
 
     def save(self, *args, **kwargs) -> None:
-        should_capture_snapshot = False
         if (
             self._state.adding
             and self.type == self.TYPE_GOAL
@@ -197,28 +201,18 @@ class Fund(models.Model):
             self.allocation_priority = max(max_priority + 1, 4)
             if self.skip_on_low_income is False:
                 self.skip_on_low_income = True
-        elif not self._state.adding and not getattr(self, "_skip_snapshot", False):
-            update_fields = kwargs.get("update_fields")
-            if update_fields is None or "current_balance" in update_fields:
-                old_balance = (
-                    Fund.objects.filter(pk=self.pk).values_list(
-                        "current_balance", flat=True
-                    ).first()
-                )
-                should_capture_snapshot = old_balance != self.current_balance
         super().save(*args, **kwargs)
-        if should_capture_snapshot:
-            NetWorthSnapshot.capture(self.account)
 
     def adjust_balance(self, amount: Decimal, capture_snapshot: bool = True) -> None:
         self.current_balance += amount
+        if not capture_snapshot:
+            self._skip_snapshot = True
         self.save(update_fields=["current_balance"])
-        if capture_snapshot:
-            NetWorthSnapshot.capture(self.account)
 
     def close(self, note: str = "") -> None:
         self.current_balance = Decimal("0.00")
         self.status = self.STATUS_CLOSED
+        self._skip_snapshot = True
         self.save(update_fields=["current_balance", "status"])
         NetWorthSnapshot.capture(self.account)
 
