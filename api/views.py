@@ -166,13 +166,7 @@ class FinancialAccountView(APIView):
         serializer = FinancialAccountSerializer(account, data=request.data, partial=True)
         serializer.is_valid(raise_exception=True)
         serializer.save()
-        return Response(
-            {
-                "account": serializer.data,
-                "profile": _account_profile(account),
-            },
-            status=status.HTTP_200_OK,
-        )
+        return Response(serializer.data, status=status.HTTP_200_OK)
 
 
 class FinancialResetView(APIView):
@@ -217,10 +211,7 @@ class SetupStatusView(APIView):
             else False
         )
         has_balances = (
-            Fund.objects.filter(
-                account=account,
-                current_balance__gt=Decimal("0.00"),
-            ).exists()
+            NetWorthSnapshot.objects.filter(account=account).count() > 1
             if account
             else False
         )
@@ -236,9 +227,7 @@ class SetupStatusView(APIView):
                 "has_custom_funds": has_custom_funds,
                 "has_balances": has_balances,
                 "has_budget": has_budget,
-                "setup_complete": all(
-                    [has_account, has_custom_funds, has_balances, has_budget]
-                ),
+                "setup_complete": all([has_account, has_balances, has_budget]),
             },
             status=status.HTTP_200_OK,
         )
@@ -313,13 +302,10 @@ class SetupBudgetView(APIView):
         setup = serializer.save(account=account)
 
         return Response(
-            {
-                "budget": MonthlyBudgetSetupSerializer(
-                    setup,
-                    context={"account": account},
-                ).data,
-                "profile": _account_profile(account),
-            },
+            MonthlyBudgetSetupSerializer(
+                setup,
+                context={"account": account},
+            ).data,
             status=status.HTTP_201_CREATED,
         )
 
@@ -357,13 +343,7 @@ class FundListCreateView(APIView):
             allocation_priority=next_priority,
             skip_on_low_income=True,
         )
-        return Response(
-            {
-                "fund": FundSerializer(fund).data,
-                "profile": _account_profile(account),
-            },
-            status=status.HTTP_201_CREATED,
-        )
+        return Response(FundSerializer(fund).data, status=status.HTTP_201_CREATED)
 
 
 class FundDetailView(APIView):
@@ -418,13 +398,7 @@ class FundDetailView(APIView):
         serializer.is_valid(raise_exception=True)
         fund = serializer.save()
 
-        return Response(
-            {
-                "fund": FundSerializer(fund).data,
-                "profile": _account_profile(account),
-            },
-            status=status.HTTP_200_OK,
-        )
+        return Response(FundSerializer(fund).data, status=status.HTTP_200_OK)
 
 
 class FundReorderView(APIView):
@@ -451,10 +425,7 @@ class FundReorderView(APIView):
 
         funds = Fund.objects.filter(account=account).order_by("allocation_priority")
         return Response(
-            {
-                "funds": FundSerializer(funds, many=True).data,
-                "profile": _account_profile(account),
-            },
+            FundSerializer(funds, many=True).data,
             status=status.HTTP_200_OK,
         )
 

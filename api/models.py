@@ -127,6 +127,8 @@ class Fund(models.Model):
         FinancialAccount,
         on_delete=models.CASCADE,
         related_name="funds",
+        null=True,
+        blank=True,
     )
     name = models.CharField(max_length=100)
     type = models.CharField(max_length=20, choices=TYPE_CHOICES)
@@ -223,6 +225,8 @@ class MonthlyBudgetSetup(models.Model):
         FinancialAccount,
         on_delete=models.CASCADE,
         related_name="budget_setups",
+        null=True,
+        blank=True,
     )
     estimated_monthly_income = models.DecimalField(max_digits=14, decimal_places=2)
     needs_budget = models.DecimalField(max_digits=14, decimal_places=2)
@@ -269,6 +273,8 @@ class MonthCycle(models.Model):
         FinancialAccount,
         on_delete=models.CASCADE,
         related_name="month_cycles",
+        null=True,
+        blank=True,
     )
     budget_setup = models.ForeignKey(
         MonthlyBudgetSetup,
@@ -478,6 +484,8 @@ class Transfer(models.Model):
         FinancialAccount,
         on_delete=models.CASCADE,
         related_name="transfers",
+        null=True,
+        blank=True,
     )
     cycle = models.ForeignKey(
         MonthCycle,
@@ -553,6 +561,8 @@ class Expense(models.Model):
         FinancialAccount,
         on_delete=models.CASCADE,
         related_name="expenses",
+        null=True,
+        blank=True,
     )
     cycle = models.ForeignKey(
         MonthCycle,
@@ -643,6 +653,8 @@ class Alert(models.Model):
         FinancialAccount,
         on_delete=models.CASCADE,
         related_name="alerts",
+        null=True,
+        blank=True,
     )
     cycle = models.ForeignKey(
         MonthCycle,
@@ -669,9 +681,11 @@ class NetWorthSnapshot(models.Model):
         FinancialAccount,
         on_delete=models.CASCADE,
         related_name="net_worth_snapshots",
+        null=True,
+        blank=True,
     )
     net_worth = models.DecimalField(max_digits=14, decimal_places=2)
-    snapshot_data = models.JSONField()
+    snapshot_data = models.JSONField(null=True, blank=True)
     captured_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -703,6 +717,8 @@ class MonthSummary(models.Model):
         FinancialAccount,
         on_delete=models.CASCADE,
         related_name="month_summaries",
+        null=True,
+        blank=True,
     )
     cycle = models.OneToOneField(
         MonthCycle,
